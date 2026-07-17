@@ -2,7 +2,7 @@
 transformer.py — Custom Optimized Transformer, adapted for music
 ================================================================
 
-Descended from ZSoul's text LM. The body is intact: flash attention, RMSNorm,
+Descended from a text LM. The body is intact: flash attention, RMSNorm,
 fused QKV, pre-norm, no-bias linears, the global std=0.02 init. What changed,
 changed because audio is not text -- each one is justified below.
 
