@@ -137,13 +137,28 @@ def main():
     ap.add_argument("--top-k", type=int, default=None)
     ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--guidance", type=float, default=None)
+    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
+                    help="'cpu' to sample safely while training holds the GPU")
     a = ap.parse_args()
 
     import transformers
     transformers.logging.set_verbosity_error()
     from codec import Codec
 
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = ("cuda" if torch.cuda.is_available() else "cpu") if a.device == "auto" \
+        else a.device
+    if dev == "cuda" and torch.cuda.is_available():
+        # Sampling alongside a training run means TWO 138M models plus two KV
+        # caches on one card. At seq_len=16384 training already holds ~15/16GB,
+        # and the second process does not get a clean OOM -- it gets a corrupted
+        # CUDA context and dies with "illegal memory access" somewhere
+        # unrelated (observed: inside apply_rope). Warn before that happens.
+        free, total = torch.cuda.mem_get_info()
+        if free / 1e9 < 4.0:
+            ui.log(f"[yellow]only {free/1e9:.1f}GB of {total/1e9:.0f}GB free on the "
+                   f"GPU — something else (training?) is using it.[/]\n"
+                   f"[dim]Two models on one card corrupts the CUDA context rather "
+                   f"than OOMing cleanly. Use --device cpu to sample safely.[/]")
     model, sig, step = load_model(a.ckpt, dev)
     codec = Codec(device=dev)
 

@@ -82,18 +82,33 @@ class Config:
     # epoch. Small batches are noisier per step but buy 8x more updates from
     # the same compute, which matters far more on a small corpus.
     grad_accum:  int   = 2
-    # LR MUST track effective batch size. 3e-4 is the standard default for
-    # effective batch ~32; we run effective batch 4 (see grad_accum), which is
-    # 8x smaller and therefore 8x noisier per gradient. Keeping 3e-4 at batch 4
-    # DIVERGED in a real run -- observed live:
-    #     step 250: loss 8.18  val 8.18   <- best
-    #     step 300: loss 8.66  val 8.23
-    #     step 350: loss 9.39  val 9.38   <- back to ~ln(vocab), unlearned
-    # It did not overfit; the optimizer took steps too large to converge and
-    # destroyed everything it had learned. Linear scaling rule: 3e-4 / 8 = ~4e-5.
-    # 5e-5 keeps a little headroom since warmup + clipping also help.
-    lr:          float = 5e-5
-    betas:       tuple = (0.9, 0.95)
+    # 3e-5 with the LAMB optimizer (see optim.py), NOT AdamW. The history:
+    #
+    #   AdamW 3e-4  -> diverged at step 350 (instant: too-high-LR signature).
+    #   AdamW 5e-5  -> clean ~600 steps, then grad norm ramped 0.7 -> 5.4 -> 10.9
+    #                  and BOTH losses turned up. Same at beta2 0.95 AND 0.999.
+    #   AdamW 1e-5  -> never diverged, but STALLED at loss 9.39 (~0.007 progress
+    #                  per 50 steps). Too cold. A slower way to get nothing.
+    #
+    # The "works then blows up 600 steps later" pattern is NOT a too-high LR
+    # (that breaks immediately). It is an UNBOUNDED update: at effective batch 4
+    # AdamW's second-moment estimate drifts and the step size wanders until it
+    # destabilizes. LAMB fixes this at the source -- its trust ratio renormalizes
+    # every layer's step to a fixed fraction of the layer's own norm each step,
+    # so a late gn ramp cannot compound. LAMB is famously LR-insensitive, which
+    # is the property four AdamW guesses proved this project needs.
+    #
+    # 3e-5 sits between the too-cold 1e-5 and the (under AdamW) too-hot 5e-5.
+    # Under LAMB the exact value matters far less; a grad-norm backoff halves it
+    # automatically if it still ramps (train.py: GradNormBackoff). This is the
+    # measured mechanism attacked directly, not a fifth guess at a magic number.
+    lr:          float = 3e-5
+    # (0.9, 0.999) -- the LAMB paper's default. beta2 is the half-life of the
+    # squared-gradient memory (0.999 ~= 1000 steps). Under AdamW at effective
+    # batch 4 this estimate drifts and was implicated in the late gn ramp; LAMB's
+    # trust ratio renormalizes on top of it every step, so the drift no longer
+    # sets the step size and 0.999 is the safe, standard choice.
+    betas:       tuple = (0.9, 0.999)
     weight_decay: float = 0.1
     warmup_steps: int  = 200
     # MEASURED ~5.5s/step at seq_len=16384, batch 2x16. The old 100k default

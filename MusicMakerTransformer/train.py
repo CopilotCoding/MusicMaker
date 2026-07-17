@@ -40,6 +40,55 @@ def lr_lambda(step, warmup, total):
     return 0.1 + 0.45 * (1 + math.cos(math.pi * min(1.0, p)))   # -> 0.1x
 
 
+class GradNormBackoff:
+    r"""Safety net on top of LAMB: if the gradient norm TRENDS upward, permanently
+    halve the LR (via a multiplier the scheduler reads).
+
+    This targets the exact AdamW failure signature -- a slow ramp over hundreds
+    of steps (0.7 -> 2.4 -> 3.6 -> 5.4), NOT the isolated single-step spikes that
+    gradient clipping already handles. So it compares two windows:
+
+        recent = mean grad-norm over the last `window` steps
+        older  = mean grad-norm over the `window` before that
+
+    and fires only when recent > older * `ratio` AND recent is itself above
+    `floor` (so noise near zero can't trip it). A cooldown prevents a cascade of
+    halvings from one sustained ramp. Once halved, it stays halved -- the ramp
+    proved the current LR was too hot for this regime.
+
+    LAMB should make this rarely fire; when it does, it is the last line of
+    defense, and it self-heals instead of requiring a manual restart.
+    """
+
+    def __init__(self, lr_scale, window=40, ratio=1.5, floor=1.0,
+                 cooldown=60, min_scale=0.01):
+        self.lr_scale = lr_scale          # shared {"v": float} the sched reads
+        self.window = window
+        self.ratio = ratio
+        self.floor = floor
+        self.cooldown = cooldown
+        self.min_scale = min_scale
+        self.hist = []
+        self.since_fire = 10 ** 9
+
+    def update(self, gnorm):
+        """Feed one step's pre-clip grad norm. Returns a message if it fired."""
+        self.hist.append(gnorm)
+        self.since_fire += 1
+        w = self.window
+        if len(self.hist) < 2 * w or self.since_fire < self.cooldown:
+            return None
+        recent = sum(self.hist[-w:]) / w
+        older = sum(self.hist[-2 * w:-w]) / w
+        if recent > older * self.ratio and recent > self.floor \
+                and self.lr_scale["v"] > self.min_scale:
+            self.lr_scale["v"] *= 0.5
+            self.since_fire = 0
+            return (f"grad-norm ramp: {older:.2f} -> {recent:.2f} over "
+                    f"{w} steps. LR halved (scale now {self.lr_scale['v']:.3f}).")
+        return None
+
+
 def per_slot_loss(logits, y, n_slots, start_pos: int = 0):
     """Mean CE per interleave slot. Diverging values = healthy RVQ structure."""
     out = []
@@ -157,10 +206,20 @@ def main():
         grad_checkpoint=(a.grad_checkpoint or CFG.grad_checkpoint),
     ).to(dev)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=CFG.betas,
-                            weight_decay=CFG.weight_decay, fused=(dev == "cuda"))
+    # LAMB, not AdamW: the trust ratio ||w||/||update|| renormalizes every
+    # layer's step to a fixed fraction of its own norm, so a late gradient-norm
+    # ramp cannot compound the way it did in all four AdamW runs. See optim.py.
+    from optim import Lamb
+    opt = Lamb(model.parameters(), lr=a.lr, betas=CFG.betas,
+               weight_decay=CFG.weight_decay)
+
+    # The backoff multiplier is a mutable box the LR lambda reads every step.
+    # LAMB makes the LR matter less; this is the belt to its suspenders --
+    # if grad-norm TRENDS up despite LAMB, we halve the LR and it stays halved.
+    lr_scale = {"v": 1.0}
     sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: lr_lambda(s, CFG.warmup_steps, a.steps))
+        opt, lambda s: lr_scale["v"] * lr_lambda(s, CFG.warmup_steps, a.steps))
+    backoff = GradNormBackoff(lr_scale)
 
     step0 = 0
     if a.resume:
@@ -179,7 +238,14 @@ def main():
                 "different codec config")
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"]); step0 = ck["step"]
-        ui.log(f"[green]resumed[/] {a.resume} @ step {step0}")
+        # Restore the backoff multiplier: a run that halved its LR before the
+        # interruption must come back halved, not at full heat.
+        lr_scale["v"] = ck.get("lr_scale", 1.0)
+        backoff.since_fire = 0   # cooldown from step 0 so it doesn't re-fire
+                                 # on the stale window it can't see
+        ui.log(f"[green]resumed[/] {a.resume} @ step {step0}"
+               + (f"  [dim](lr_scale {lr_scale['v']:.3f})[/]"
+                  if lr_scale["v"] != 1.0 else ""))
 
     ui.rule("MusicMaker — training")
     ui.kv_table([
@@ -212,6 +278,16 @@ def main():
                 ui.log(f"[dim]existing best: val {best_val:.3f} @ step {best_step}[/]")
         except Exception:
             pass
+
+    # EVERY STEP goes to a CSV. Six hours were burned reading a scrolling
+    # terminal and mistaking single-step spikes for trends (and trends for
+    # spikes). A file you can plot removes the guessing: gn, loss, lr and val
+    # over time, with nothing thrown away between evals.
+    metrics_p = CKPT_DIR / "metrics.csv"
+    new_file = not metrics_p.exists() or step0 == 0
+    metrics_f = open(metrics_p, "a" if not new_file else "w", buffering=1)
+    if new_file:
+        metrics_f.write("step,loss,ppl,lr,grad_norm,val_loss,vram_gb,elapsed_s\n")
 
     model.train()
     it = iter(dl)
@@ -248,7 +324,20 @@ def main():
         gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip))
         opt.step(); sched.step()
 
+        # Safety backoff: halve the LR if grad-norm trends up despite LAMB.
+        msg = backoff.update(gnorm)
+        if msg:
+            if prog:
+                prog.stop()
+            ui.log(f"[bold yellow]!! {msg}[/]")
+            if prog:
+                prog.start()
+
         peak = torch.cuda.max_memory_allocated() / 1e9 if dev == "cuda" else 0
+        # one row per step -- val is blank except on eval steps
+        metrics_f.write(f"{step},{tot:.4f},{math.exp(min(tot,20)):.1f},"
+                        f"{sched.get_last_lr()[0]:.3e},{gnorm:.4f},,"
+                        f"{peak:.2f},{time.time()-t0:.0f}\n")
         if prog:
             dt = time.time() - t0
             tps = (step - step0 + 1) * a.batch_size * a.grad_accum * a.seq_len / max(dt, 1e-9)
@@ -307,6 +396,10 @@ def main():
                        "interleave may be broken[/]")
             if vdl:
                 vl = evaluate(model, vdl, dev, codec_sig["n_slots"])
+                # val gets its own row so a plot can join train and val on step
+                metrics_f.write(f"{step},{tot:.4f},{math.exp(min(tot,20)):.1f},"
+                                f"{sched.get_last_lr()[0]:.3e},{gnorm:.4f},"
+                                f"{vl:.4f},{peak:.2f},{time.time()-t0:.0f}\n")
                 # Track the BEST model, not just the last one. With 1444
                 # windows over ~22 epochs this WILL overfit: train loss keeps
                 # falling while val loss bottoms out and turns back up. Without
@@ -315,7 +408,8 @@ def main():
                 if vl < best_val:
                     best_val, best_step = vl, step
                     _save(CKPT_DIR / "best.pt", model, opt, sched, step, a,
-                          codec_sig, t5_id, d_text, val=vl, quiet=True)
+                          codec_sig, t5_id, d_text, val=vl, quiet=True,
+                          lr_scale=lr_scale["v"])
                     ui.log(f"   [dim]val loss[/] [bold green]{vl:.3f}[/] "
                            f"[dim]<- new best, saved best.pt[/]")
                 else:
@@ -341,13 +435,16 @@ def main():
 
         if step > step0 and step % CFG.ckpt_interval == 0:
             p = CKPT_DIR / f"step{step}.pt"
-            _save(p, model, opt, sched, step, a, codec_sig, t5_id, d_text)
+            _save(p, model, opt, sched, step, a, codec_sig, t5_id, d_text,
+                  lr_scale=lr_scale["v"])
             ui.log(f"   [dim]saved[/] {p}")
 
     if prog:
         prog.stop()
+    metrics_f.close()
     p = CKPT_DIR / "final.pt"
-    _save(p, model, opt, sched, a.steps, a, codec_sig, t5_id, d_text)
+    _save(p, model, opt, sched, a.steps, a, codec_sig, t5_id, d_text,
+          lr_scale=lr_scale["v"])
     body = (f"final checkpoint: [bold]{p}[/]\n"
             f"last train loss: [bold]{tot:.3f}[/]  "
             f"ppl [bold]{math.exp(min(tot, 20)):.1f}[/]")
@@ -359,13 +456,17 @@ def main():
 
 
 def _save(path, model, opt, sched, step, a, codec_sig, t5_id, d_text,
-          val=None, quiet=False):
+          val=None, quiet=False, lr_scale=1.0):
     """One place that knows the checkpoint format. generate.py reads codec_sig
     to rebuild the model, so these keys are a contract -- don't drift them."""
     torch.save({
         "model": model.state_dict(), "opt": opt.state_dict(),
         "sched": sched.state_dict(), "step": step, "cfg": vars(a),
         "val_loss": val,
+        # LambdaLR.state_dict() drops the lambda, so the backoff multiplier
+        # would be lost on resume -- a run that had halved its LR would come
+        # back at full heat. Persist it explicitly.
+        "lr_scale": lr_scale,
         "codec_sig": {
             "codec_id": codec_sig["model_id"], "n_q": codec_sig["n_q"],
             "n_slots": codec_sig["n_slots"], "channels": codec_sig["channels"],
