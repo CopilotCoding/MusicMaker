@@ -82,7 +82,17 @@ class Config:
     # epoch. Small batches are noisier per step but buy 8x more updates from
     # the same compute, which matters far more on a small corpus.
     grad_accum:  int   = 2
-    lr:          float = 3e-4
+    # LR MUST track effective batch size. 3e-4 is the standard default for
+    # effective batch ~32; we run effective batch 4 (see grad_accum), which is
+    # 8x smaller and therefore 8x noisier per gradient. Keeping 3e-4 at batch 4
+    # DIVERGED in a real run -- observed live:
+    #     step 250: loss 8.18  val 8.18   <- best
+    #     step 300: loss 8.66  val 8.23
+    #     step 350: loss 9.39  val 9.38   <- back to ~ln(vocab), unlearned
+    # It did not overfit; the optimizer took steps too large to converge and
+    # destroyed everything it had learned. Linear scaling rule: 3e-4 / 8 = ~4e-5.
+    # 5e-5 keeps a little headroom since warmup + clipping also help.
+    lr:          float = 5e-5
     betas:       tuple = (0.9, 0.95)
     weight_decay: float = 0.1
     warmup_steps: int  = 200

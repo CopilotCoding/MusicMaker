@@ -241,7 +241,11 @@ def main():
             (loss / a.grad_accum).backward()
             tot += loss.item() / a.grad_accum
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
+        # clip_grad_norm_ returns the PRE-clip norm -- the single best early
+        # warning of instability. If it sits far above grad_clip the optimizer
+        # is being clipped every step, which means the LR is too high for this
+        # batch size and the run is heading for divergence.
+        gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip))
         opt.step(); sched.step()
 
         peak = torch.cuda.max_memory_allocated() / 1e9 if dev == "cuda" else 0
@@ -250,8 +254,10 @@ def main():
             tps = (step - step0 + 1) * a.batch_size * a.grad_accum * a.seq_len / max(dt, 1e-9)
             prog.update(task, completed=step + 1, stats=(
                 f"loss [bold]{tot:.3f}[/] ppl [bold]{math.exp(min(tot,20)):.1f}[/] "
-                f"lr {sched.get_last_lr()[0]:.1e} {tps/1e3:.0f}k tok/s "
-                f"vram {peak:.1f}GB"))
+                f"lr {sched.get_last_lr()[0]:.1e} "
+                f"gn {'[red]' if gnorm > CFG.grad_clip * 5 else ''}{gnorm:.1f}"
+                f"{'[/]' if gnorm > CFG.grad_clip * 5 else ''} "
+                f"{tps/1e3:.0f}k tok/s vram {peak:.1f}GB"))
         elif step % 10 == 0:
             print(f"step {step:5d} | loss {tot:6.3f} | ppl {math.exp(min(tot,20)):8.1f} | "
                   f"vram {peak:.1f}GB")
@@ -313,9 +319,23 @@ def main():
                     ui.log(f"   [dim]val loss[/] [bold green]{vl:.3f}[/] "
                            f"[dim]<- new best, saved best.pt[/]")
                 else:
+                    # Val rising has TWO causes that need opposite responses:
+                    #  - OVERFITTING: train loss keeps falling, val climbs. The
+                    #    model is memorizing. best.pt already has the good one.
+                    #  - DIVERGING: train loss climbs TOO, back toward
+                    #    ln(vocab). The optimizer is unstable -- LR too high for
+                    #    the batch size. Nothing later will be better; stop and
+                    #    lower the LR.
+                    # Calling both "overfitting" sent exactly the wrong signal
+                    # once already, so distinguish them.
+                    tag = ""
+                    if tot > best_val * 1.05 and vl > best_val * 1.05:
+                        tag = " — [bold red]DIVERGING: train loss rising too, " \
+                              "lower --lr[/]"
+                    elif vl > best_val * 1.05:
+                        tag = " — [yellow]overfitting[/]"
                     ui.log(f"   [dim]val loss[/] [bold]{vl:.3f}[/] "
-                           f"[dim](best {best_val:.3f} @ step {best_step}"
-                           f"{' — OVERFITTING' if vl > best_val * 1.05 else ''})[/]")
+                           f"[dim](best {best_val:.3f} @ step {best_step})[/]{tag}")
             if prog:
                 prog.start()
 
