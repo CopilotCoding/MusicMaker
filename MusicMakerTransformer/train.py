@@ -180,7 +180,7 @@ def main():
     codec_sig = {"vocab_size": codec.vocab_size, "n_slots": codec.n_slots,
                  "channels": codec.channels, "n_q": codec.n_q,
                  "tokens_per_sec": codec.tokens_per_sec, "sr": codec.sr,
-                 "model_id": codec.model_id}
+                 "model_id": codec.model_id, "bos": codec.bos}
     d_text, t5_id = te.d_text, te.model_id
     del codec, te
     import gc; gc.collect()
@@ -188,10 +188,16 @@ def main():
         torch.cuda.empty_cache()
 
     dropout = 0.0 if a.overfit else CFG.dropout
-    ds = MusicDataset(paths, a.seq_len, codec_sig["n_slots"], random_crop=not a.overfit)
+    ds = MusicDataset(paths, a.seq_len, codec_sig["n_slots"],
+                      random_crop=not a.overfit, bos=codec_sig["bos"])
+    # Split by SONG, not by window: hold out whole tracks so no song has some of
+    # its windows in train and others in val. A window-level split leaks --
+    # adjacent windows of the same song are near-identical, so val would be
+    # scoring on audio the model effectively trained on, and the val number
+    # would read better than it is. Whole-song holdout makes val honest.
     n_val = max(1, int(len(ds) * CFG.val_frac)) if not a.overfit else 0
     if n_val and len(ds) > n_val * 2:
-        tr, va = torch.utils.data.random_split(ds, [len(ds) - n_val, n_val])
+        tr, va = _split_by_song(ds, CFG.val_frac, CFG.seed)
     else:
         tr, va = ds, None
 
@@ -296,148 +302,195 @@ def main():
     task = prog.add_task("train", total=a.steps, completed=step0, stats="") if prog else None
     if prog:
         prog.start()
-    for step in range(step0, a.steps):
-        opt.zero_grad(set_to_none=True)
-        tot = 0.0
-        for _ in range(a.grad_accum):
-            try:
-                b = next(it)
-            except StopIteration:
-                it = iter(dl); b = next(it)
-            x, y = b["x"].to(dev, non_blocking=True), b["y"].to(dev, non_blocking=True)
-            ctx = b["ctx"].to(dev) if b["ctx"] is not None else None
-            msk = b["ctx_mask"].to(dev) if b["ctx_mask"] is not None else None
-            # Conditioning dropout: trains the unconditional path in the same
-            # run, which is exactly what classifier-free guidance samples from.
-            if ctx is not None and not a.overfit and torch.rand(1).item() < CFG.cond_dropout:
-                ctx, msk = None, None
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
-                lg = model(x, ctx, msk)
-                loss = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), y.reshape(-1))
-            (loss / a.grad_accum).backward()
-            tot += loss.item() / a.grad_accum
 
-        # clip_grad_norm_ returns the PRE-clip norm -- the single best early
-        # warning of instability. If it sits far above grad_clip the optimizer
-        # is being clipped every step, which means the LR is too high for this
-        # batch size and the run is heading for divergence.
-        gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip))
-        opt.step(); sched.step()
+    # Ctrl-C (or a crash) used to lose the optimizer/scheduler/step state --
+    # best.pt only holds weights + val, so a resume restarted the LR schedule
+    # from zero. Seed step/tot so the exit handler below can always reference
+    # them, then run the loop inside a try that writes a fully-resumable
+    # interrupted.pt on ANY exit.
+    step, tot = step0, float("nan")
+    interrupted = False
+    try:
+        for step in range(step0, a.steps):
+            opt.zero_grad(set_to_none=True)
+            tot = 0.0
+            for _ in range(a.grad_accum):
+                try:
+                    b = next(it)
+                except StopIteration:
+                    it = iter(dl); b = next(it)
+                x, y = b["x"].to(dev, non_blocking=True), b["y"].to(dev, non_blocking=True)
+                ctx = b["ctx"].to(dev) if b["ctx"] is not None else None
+                msk = b["ctx_mask"].to(dev) if b["ctx_mask"] is not None else None
+                # Conditioning dropout: trains the unconditional path in the same
+                # run, which is exactly what classifier-free guidance samples from.
+                if ctx is not None and not a.overfit and torch.rand(1).item() < CFG.cond_dropout:
+                    ctx, msk = None, None
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
+                    lg = model(x, ctx, msk)
+                    loss = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), y.reshape(-1))
+                (loss / a.grad_accum).backward()
+                tot += loss.item() / a.grad_accum
 
-        # Safety backoff: halve the LR if grad-norm trends up despite LAMB.
-        msg = backoff.update(gnorm)
-        if msg:
+            # clip_grad_norm_ returns the PRE-clip norm -- the single best early
+            # warning of instability. If it sits far above grad_clip the optimizer
+            # is being clipped every step, which means the LR is too high for this
+            # batch size and the run is heading for divergence.
+            gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip))
+            opt.step(); sched.step()
+
+            # Safety backoff: halve the LR if grad-norm trends up despite LAMB.
+            msg = backoff.update(gnorm)
+            if msg:
+                if prog:
+                    prog.stop()
+                ui.log(f"[bold yellow]!! {msg}[/]")
+                if prog:
+                    prog.start()
+
+            peak = torch.cuda.max_memory_allocated() / 1e9 if dev == "cuda" else 0
+            # one row per step -- val is blank except on eval steps
+            metrics_f.write(f"{step},{tot:.4f},{math.exp(min(tot,20)):.1f},"
+                            f"{sched.get_last_lr()[0]:.3e},{gnorm:.4f},,"
+                            f"{peak:.2f},{time.time()-t0:.0f}\n")
             if prog:
-                prog.stop()
-            ui.log(f"[bold yellow]!! {msg}[/]")
-            if prog:
-                prog.start()
+                dt = time.time() - t0
+                tps = (step - step0 + 1) * a.batch_size * a.grad_accum * a.seq_len / max(dt, 1e-9)
+                prog.update(task, completed=step + 1, stats=(
+                    f"loss [bold]{tot:.3f}[/] ppl [bold]{math.exp(min(tot,20)):.1f}[/] "
+                    f"lr {sched.get_last_lr()[0]:.1e} "
+                    f"gn {'[red]' if gnorm > CFG.grad_clip * 5 else ''}{gnorm:.1f}"
+                    f"{'[/]' if gnorm > CFG.grad_clip * 5 else ''} "
+                    f"{tps/1e3:.0f}k tok/s vram {peak:.1f}GB"))
+            elif step % 10 == 0:
+                print(f"step {step:5d} | loss {tot:6.3f} | ppl {math.exp(min(tot,20)):8.1f} | "
+                      f"vram {peak:.1f}GB")
 
-        peak = torch.cuda.max_memory_allocated() / 1e9 if dev == "cuda" else 0
-        # one row per step -- val is blank except on eval steps
-        metrics_f.write(f"{step},{tot:.4f},{math.exp(min(tot,20)):.1f},"
-                        f"{sched.get_last_lr()[0]:.3e},{gnorm:.4f},,"
-                        f"{peak:.2f},{time.time()-t0:.0f}\n")
+            # Windows won't OOM -- it spills to host memory and crawls. Assert.
+            if step % 10 == 0:
+                assert peak < CFG.vram_budget_gb, (
+                    f"peak VRAM {peak:.1f}GB exceeds {CFG.vram_budget_gb}GB budget; "
+                    "on Windows this silently spills to shared memory instead of "
+                    "raising OOM. Lower batch_size or seq_len."
+                )
+
+            # Fire on the FIRST step too, not just every eval_interval. The
+            # per-slot table is the only check that the interleave is intact, and
+            # that is worth knowing 10 seconds in rather than 9 minutes in -- a
+            # broken interleave means the whole run is training on noise.
+            if step == step0 or (step > step0 and step % CFG.eval_interval == 0):
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,
+                                                     enabled=(dev == "cuda")):
+                    ps = per_slot_loss(model(x[:1], ctx[:1] if ctx is not None else None,
+                                             msk[:1] if msk is not None else None),
+                                       y[:1], codec_sig["n_slots"])
+                names = [f"q{s//codec_sig['channels']}{'LR'[s%codec_sig['channels']]}"
+                         for s in range(codec_sig["n_slots"])]
+                if prog:
+                    prog.stop()
+                title = f"per-slot loss @ step {step}"
+                if step == step0:
+                    # ln(16386)=9.70 -- an untrained model guessing uniformly lands
+                    # here, so this row is the baseline every later table is read
+                    # against, not a warning sign.
+                    title += "  [dim](baseline: untrained ~= ln(vocab) = " \
+                             f"{math.log(codec_sig['vocab_size']):.2f})[/]"
+                ui.slot_table(names, ps, title=title)
+                # Coarse slots should sit well below fine ones -- that spread IS the
+                # RVQ residual structure showing up in the loss. Flat slots CAN mean
+                # a broken interleave, but only in the middle of the range:
+                #   - at step ~0 everything is ~ln(vocab)=9.7 because the model is
+                #     untrained and guessing uniformly. Flat is CORRECT here.
+                #   - after memorizing, everything collapses to ~0. Flat again, also
+                #     correct.
+                # So only warn once training has had a real chance to differentiate
+                # the slots AND the loss is still stuck near the uniform-guess line.
+                warmed = step >= max(200, CFG.warmup_steps)
+                if warmed and max(ps) - min(ps) < 0.05 and min(ps) > 0.5:
+                    ui.log("[bold red]!! slots flat and still high after warmup — "
+                           "interleave may be broken[/]")
+                if vdl:
+                    vl = evaluate(model, vdl, dev, codec_sig["n_slots"])
+                    # val gets its own row so a plot can join train and val on step
+                    metrics_f.write(f"{step},{tot:.4f},{math.exp(min(tot,20)):.1f},"
+                                    f"{sched.get_last_lr()[0]:.3e},{gnorm:.4f},"
+                                    f"{vl:.4f},{peak:.2f},{time.time()-t0:.0f}\n")
+                    # Track the BEST model, not just the last one. With 1444
+                    # windows over ~22 epochs this WILL overfit: train loss keeps
+                    # falling while val loss bottoms out and turns back up. Without
+                    # this, final.pt could be hours past the good model and nothing
+                    # would tell you which step to go back to.
+                    if vl < best_val:
+                        best_val, best_step = vl, step
+                        _save(CKPT_DIR / "best.pt", model, opt, sched, step, a,
+                              codec_sig, t5_id, d_text, val=vl, quiet=True,
+                              lr_scale=lr_scale["v"])
+                        ui.log(f"   [dim]val loss[/] [bold green]{vl:.3f}[/] "
+                               f"[dim]<- new best, saved best.pt[/]")
+                    else:
+                        # Val rising has TWO causes that need opposite responses:
+                        #  - OVERFITTING: train loss keeps falling, val climbs. The
+                        #    model is memorizing. best.pt already has the good one.
+                        #  - DIVERGING: train loss climbs TOO, back toward
+                        #    ln(vocab). The optimizer is unstable -- LR too high for
+                        #    the batch size. Nothing later will be better; stop and
+                        #    lower the LR.
+                        # Calling both "overfitting" sent exactly the wrong signal
+                        # once already, so distinguish them.
+                        tag = ""
+                        if tot > best_val * 1.05 and vl > best_val * 1.05:
+                            tag = " — [bold red]DIVERGING: train loss rising too, " \
+                                  "lower --lr[/]"
+                        elif vl > best_val * 1.05:
+                            tag = " — [yellow]overfitting[/]"
+                        ui.log(f"   [dim]val loss[/] [bold]{vl:.3f}[/] "
+                               f"[dim](best {best_val:.3f} @ step {best_step})[/]{tag}")
+                if prog:
+                    prog.start()
+
+            if step > step0 and step % CFG.ckpt_interval == 0:
+                p = CKPT_DIR / f"step{step}.pt"
+                _save(p, model, opt, sched, step, a, codec_sig, t5_id, d_text,
+                      lr_scale=lr_scale["v"])
+                ui.log(f"   [dim]saved[/] {p}")
+
+    except KeyboardInterrupt:
+        interrupted = True
         if prog:
-            dt = time.time() - t0
-            tps = (step - step0 + 1) * a.batch_size * a.grad_accum * a.seq_len / max(dt, 1e-9)
-            prog.update(task, completed=step + 1, stats=(
-                f"loss [bold]{tot:.3f}[/] ppl [bold]{math.exp(min(tot,20)):.1f}[/] "
-                f"lr {sched.get_last_lr()[0]:.1e} "
-                f"gn {'[red]' if gnorm > CFG.grad_clip * 5 else ''}{gnorm:.1f}"
-                f"{'[/]' if gnorm > CFG.grad_clip * 5 else ''} "
-                f"{tps/1e3:.0f}k tok/s vram {peak:.1f}GB"))
-        elif step % 10 == 0:
-            print(f"step {step:5d} | loss {tot:6.3f} | ppl {math.exp(min(tot,20)):8.1f} | "
-                  f"vram {peak:.1f}GB")
+            prog.stop()
+        ui.log("[yellow]interrupted (Ctrl-C)[/] — saving resumable checkpoint...")
+    except BaseException as e:
+        # ANY crash (OOM, assert, etc.): still try to save so hours aren't lost.
+        interrupted = True
+        if prog:
+            prog.stop()
+        ui.log(f"[red]crashed:[/] {type(e).__name__}: {e} — "
+               "saving resumable checkpoint before re-raising...")
+        _save_interrupted(model, opt, sched, step, a, codec_sig, t5_id, d_text,
+                          lr_scale["v"], metrics_f)
+        raise
+    finally:
+        # Always flush metrics; the file is line-buffered but be safe.
+        try:
+            metrics_f.flush()
+        except Exception:
+            pass
 
-        # Windows won't OOM -- it spills to host memory and crawls. Assert.
-        if step % 10 == 0:
-            assert peak < CFG.vram_budget_gb, (
-                f"peak VRAM {peak:.1f}GB exceeds {CFG.vram_budget_gb}GB budget; "
-                "on Windows this silently spills to shared memory instead of "
-                "raising OOM. Lower batch_size or seq_len."
-            )
-
-        # Fire on the FIRST step too, not just every eval_interval. The
-        # per-slot table is the only check that the interleave is intact, and
-        # that is worth knowing 10 seconds in rather than 9 minutes in -- a
-        # broken interleave means the whole run is training on noise.
-        if step == step0 or (step > step0 and step % CFG.eval_interval == 0):
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,
-                                                 enabled=(dev == "cuda")):
-                ps = per_slot_loss(model(x[:1], ctx[:1] if ctx is not None else None,
-                                         msk[:1] if msk is not None else None),
-                                   y[:1], codec_sig["n_slots"])
-            names = [f"q{s//codec_sig['channels']}{'LR'[s%codec_sig['channels']]}"
-                     for s in range(codec_sig["n_slots"])]
-            if prog:
-                prog.stop()
-            title = f"per-slot loss @ step {step}"
-            if step == step0:
-                # ln(16386)=9.70 -- an untrained model guessing uniformly lands
-                # here, so this row is the baseline every later table is read
-                # against, not a warning sign.
-                title += "  [dim](baseline: untrained ~= ln(vocab) = " \
-                         f"{math.log(codec_sig['vocab_size']):.2f})[/]"
-            ui.slot_table(names, ps, title=title)
-            # Coarse slots should sit well below fine ones -- that spread IS the
-            # RVQ residual structure showing up in the loss. Flat slots CAN mean
-            # a broken interleave, but only in the middle of the range:
-            #   - at step ~0 everything is ~ln(vocab)=9.7 because the model is
-            #     untrained and guessing uniformly. Flat is CORRECT here.
-            #   - after memorizing, everything collapses to ~0. Flat again, also
-            #     correct.
-            # So only warn once training has had a real chance to differentiate
-            # the slots AND the loss is still stuck near the uniform-guess line.
-            warmed = step >= max(200, CFG.warmup_steps)
-            if warmed and max(ps) - min(ps) < 0.05 and min(ps) > 0.5:
-                ui.log("[bold red]!! slots flat and still high after warmup — "
-                       "interleave may be broken[/]")
-            if vdl:
-                vl = evaluate(model, vdl, dev, codec_sig["n_slots"])
-                # val gets its own row so a plot can join train and val on step
-                metrics_f.write(f"{step},{tot:.4f},{math.exp(min(tot,20)):.1f},"
-                                f"{sched.get_last_lr()[0]:.3e},{gnorm:.4f},"
-                                f"{vl:.4f},{peak:.2f},{time.time()-t0:.0f}\n")
-                # Track the BEST model, not just the last one. With 1444
-                # windows over ~22 epochs this WILL overfit: train loss keeps
-                # falling while val loss bottoms out and turns back up. Without
-                # this, final.pt could be hours past the good model and nothing
-                # would tell you which step to go back to.
-                if vl < best_val:
-                    best_val, best_step = vl, step
-                    _save(CKPT_DIR / "best.pt", model, opt, sched, step, a,
-                          codec_sig, t5_id, d_text, val=vl, quiet=True,
-                          lr_scale=lr_scale["v"])
-                    ui.log(f"   [dim]val loss[/] [bold green]{vl:.3f}[/] "
-                           f"[dim]<- new best, saved best.pt[/]")
-                else:
-                    # Val rising has TWO causes that need opposite responses:
-                    #  - OVERFITTING: train loss keeps falling, val climbs. The
-                    #    model is memorizing. best.pt already has the good one.
-                    #  - DIVERGING: train loss climbs TOO, back toward
-                    #    ln(vocab). The optimizer is unstable -- LR too high for
-                    #    the batch size. Nothing later will be better; stop and
-                    #    lower the LR.
-                    # Calling both "overfitting" sent exactly the wrong signal
-                    # once already, so distinguish them.
-                    tag = ""
-                    if tot > best_val * 1.05 and vl > best_val * 1.05:
-                        tag = " — [bold red]DIVERGING: train loss rising too, " \
-                              "lower --lr[/]"
-                    elif vl > best_val * 1.05:
-                        tag = " — [yellow]overfitting[/]"
-                    ui.log(f"   [dim]val loss[/] [bold]{vl:.3f}[/] "
-                           f"[dim](best {best_val:.3f} @ step {best_step})[/]{tag}")
-            if prog:
-                prog.start()
-
-        if step > step0 and step % CFG.ckpt_interval == 0:
-            p = CKPT_DIR / f"step{step}.pt"
-            _save(p, model, opt, sched, step, a, codec_sig, t5_id, d_text,
-                  lr_scale=lr_scale["v"])
-            ui.log(f"   [dim]saved[/] {p}")
+    if interrupted:
+        # Ctrl-C path: save the resume point, report where to pick up, and stop
+        # WITHOUT overwriting final.pt (that means "ran to completion").
+        _save_interrupted(model, opt, sched, step, a, codec_sig, t5_id, d_text,
+                          lr_scale["v"], metrics_f)
+        metrics_f.close()
+        ui.panel(
+            f"stopped at step [bold]{step}[/]/{a.steps}. "
+            f"Resume exactly here with:\n\n"
+            f"  [bold]python train.py --music-dir \"...\" "
+            f"--resume checkpoints/interrupted.pt[/]\n\n"
+            f"[dim]best model so far: checkpoints/best.pt "
+            f"(val {best_val:.3f} @ step {best_step}) — use THAT to generate.[/]",
+            title="saved — resumable", style="yellow")
+        return
 
     if prog:
         prog.stop()
@@ -453,6 +506,37 @@ def main():
                  f"\n[dim]-> generate from checkpoints/best.pt, not final.pt,"
                  f" unless val was still falling at the end[/]")
     ui.panel(body, title="done", style="green")
+
+
+def _split_by_song(ds, val_frac, seed):
+    """Hold out whole tracks for validation, not individual windows.
+
+    ds.index is [(track_idx, window), ...]; grouping by track_idx and assigning
+    whole tracks to val guarantees no song straddles the split. Returns
+    (train_subset, val_subset).
+    """
+    from collections import defaultdict
+    from torch.utils.data import Subset
+
+    by_track = defaultdict(list)
+    for pos, (ti, _w) in enumerate(ds.index):
+        by_track[ti].append(pos)
+
+    tracks = list(by_track.keys())
+    g = torch.Generator().manual_seed(seed)
+    order = torch.randperm(len(tracks), generator=g).tolist()
+
+    n_val_windows = max(1, int(len(ds) * val_frac))
+    val_pos, taken = [], 0
+    for oi in order:                       # add whole tracks until we hit ~val_frac
+        ti = tracks[oi]
+        val_pos += by_track[ti]
+        taken += len(by_track[ti])
+        if taken >= n_val_windows:
+            break
+    val_set = set(val_pos)
+    train_pos = [p for p in range(len(ds)) if p not in val_set]
+    return Subset(ds, train_pos), Subset(ds, val_pos)
 
 
 def _save(path, model, opt, sched, step, a, codec_sig, t5_id, d_text,
@@ -476,6 +560,27 @@ def _save(path, model, opt, sched, step, a, codec_sig, t5_id, d_text,
             "n_layers": CFG.n_layers, "d_ff": CFG.d_ff,
             "max_seq_len": max(a.seq_len, CFG.max_seq_len),
         }}, path)
+
+
+def _save_interrupted(model, opt, sched, step, a, codec_sig, t5_id, d_text,
+                      lr_scale, metrics_f):
+    """Write a fully-resumable checkpoint at the CURRENT step on Ctrl-C/crash.
+
+    Separate file from best.pt (which tracks the best VAL model, not the last
+    step) and from final.pt (which means "ran to completion"). Written to a temp
+    path then renamed, so a Ctrl-C DURING the save can't leave a truncated file
+    that fails to load -- the whole point is to always have a valid resume point.
+    """
+    try:
+        metrics_f.flush()
+    except Exception:
+        pass
+    p = CKPT_DIR / "interrupted.pt"
+    tmp = CKPT_DIR / "interrupted.pt.tmp"
+    _save(tmp, model, opt, sched, step, a, codec_sig, t5_id, d_text,
+          lr_scale=lr_scale, quiet=True)
+    tmp.replace(p)   # atomic on the same filesystem
+    ui.log(f"   [green]saved resumable[/] {p} [dim]@ step {step}[/]")
 
 
 if __name__ == "__main__":

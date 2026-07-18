@@ -203,17 +203,41 @@ def build_cache(codec, textenc=None, raw_dir=None, force: bool = False,
 
 class MusicDataset(Dataset):
     """
-    Serves (seq_len+1)-token windows snapped to the interleave stride.
+    Serves each song IN ORDER as fixed, non-overlapping seq_len windows --
+    start to finish, never random chunks. Window 0 of every song carries a BOS,
+    so the model learns to begin a song from nothing; every later window is a
+    plain next-token slice continuing where the previous one ended.
 
-    random_crop moves the window each epoch for augmentation, but ALWAYS lands
-    on a multiple of n_slots -- an unaligned crop is silent corruption.
+    WHY IN-ORDER, NON-OVERLAPPING (deliberate, replaces random-crop):
+      - Random cropping fed a different random slice each step -- fine for
+        learning LOCAL transitions, but the model never saw a song's true
+        progression start to finish, and free-run generation (which begins at
+        the song start) had no coherent position-0 to reproduce.
+      - Fixed in-order windows teach the actual song: window k is [k*S, (k+1)*S),
+        so concatenating the model's continuations walks the whole track.
+      - Tradeoff: no crop augmentation, so the same windows repeat every epoch;
+        on a small corpus this memorizes faster and can overfit sooner. best.pt
+        (best val) matters more as a result.
+
+    BOS: input for window 0 is [BOS, t0, ..., t_{S-2}], target [t0, ..., t_{S-1}]
+    -- BOS at position 0 predicts the real first token. Generation feeds BOS the
+    same way, so training and generation agree on what position 0 holds. Without
+    it, position 0 is a real token in training but BOS in generation, shifting
+    every token one RoPE position -> silent garbage. If bos is None, window 0 is
+    a plain slice too (only primed generation works then).
     """
     def __init__(self, cache_paths, seq_len: int, n_slots: int,
-                 random_crop: bool = True):
+                 random_crop: bool = False, bos: int | None = None):
         assert seq_len % n_slots == 0, f"seq_len {seq_len} must be a multiple of n_slots {n_slots}"
         self.seq_len = seq_len
         self.n_slots = n_slots
-        self.random_crop = random_crop
+        self.bos = bos
+        # random_crop is accepted for call-compatibility but IGNORED: training is
+        # always strictly in-order now. Warn rather than silently do the wrong
+        # thing if someone still passes True expecting the old behaviour.
+        if random_crop:
+            ui.log("[dim]note: random_crop is ignored — training is strictly "
+                   "in-order, non-overlapping windows now.[/]")
 
         self.tracks, self.index = [], []
         for p in cache_paths:
@@ -221,14 +245,25 @@ class MusicDataset(Dataset):
             codes = torch.from_numpy(z["codes"].astype(np.int64))
             ctx = torch.from_numpy(z["ctx"].astype(np.float32)) if "ctx" in z else None
             msk = torch.from_numpy(z["ctx_mask"]) if "ctx_mask" in z else None
-            if codes.shape[0] < seq_len + n_slots:
+            min_len = seq_len if bos is not None else seq_len + 1
+            if codes.shape[0] < min_len:
                 continue
             ti = len(self.tracks)
             self.tracks.append({"codes": codes, "ctx": ctx, "mask": msk,
                                 "name": p.stem})
-            # windows stride by seq_len; +1 target token must stay in range
-            n_win = (codes.shape[0] - seq_len - 1) // seq_len + 1
-            self.index += [(ti, w * seq_len) for w in range(n_win)]
+            # Fixed, non-overlapping TARGET coverage: chunk 0 targets t0..t_{S-1}
+            # (from BOS), interior chunk w targets t_{wS}..t_{wS+S-1} (its input
+            # starts ONE token early, at t_{wS-1}). Without that one-early start
+            # the boundary token t_{wS} is never anyone's target -- chunk 0's
+            # targets stop at t_{S-1} and chunk 1's used to begin at t_{S+1} --
+            # so generation hit position S with a token the model was never
+            # trained to produce, and derailed exactly there (measured: 68.2%
+            # free-run match = 4096/6000 = chunk 0 perfect, then noise).
+            if bos is not None:
+                n_win = codes.shape[0] // seq_len         # chunk w needs (w+1)S
+            else:
+                n_win = (codes.shape[0] - 1) // seq_len   # legacy, no BOS
+            self.index += [(ti, w) for w in range(max(1, n_win))]
         if not self.tracks:
             raise SystemExit("no track long enough for seq_len — lower seq_len")
 
@@ -236,17 +271,32 @@ class MusicDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, i):
-        ti, start = self.index[i]
+        ti, w = self.index[i]
         tr = self.tracks[ti]
         codes = tr["codes"]
-        hi = codes.shape[0] - self.seq_len - 1
-        if self.random_crop and hi > 0:
-            start = int(torch.randint(0, hi // self.n_slots + 1, (1,)).item()) * self.n_slots
-        start = min(start, max(0, hi))
-        start -= start % self.n_slots                     # snap, always
-        assert start % self.n_slots == 0
-        win = codes[start:start + self.seq_len + 1]
-        return {"tokens": win, "ctx": tr["ctx"], "mask": tr["mask"],
+        start = w * self.seq_len                           # fixed, in-order
+        assert start % self.n_slots == 0                   # multiple of S, so OK
+
+        if self.bos is not None and w == 0:
+            # First window of the song: mark the start with BOS.
+            # input  = [BOS, t0, ..., t_{S-2}]   target = [t0, ..., t_{S-1}]
+            real = codes[0:self.seq_len]
+            x = torch.cat([torch.tensor([self.bos], dtype=real.dtype), real[:-1]])
+            y = real
+        elif self.bos is not None:
+            # Interior window, starting ONE token early so the boundary token
+            # t_{wS} is a target:  input [t_{wS-1} .. t_{wS+S-2}]
+            #                      target [t_{wS}   .. t_{wS+S-1}]
+            # Target coverage across chunks is then contiguous: every token in
+            # the song is predicted exactly once. y still begins on slot 0
+            # (wS % n_slots == 0), so the per-slot loss table stays valid.
+            win = codes[start - 1:start + self.seq_len]
+            x, y = win[:-1], win[1:]
+        else:
+            # Legacy (no BOS): plain next-token slice.
+            win = codes[start:start + self.seq_len + 1]
+            x, y = win[:-1], win[1:]
+        return {"x": x, "y": y, "ctx": tr["ctx"], "mask": tr["mask"],
                 "name": tr["name"]}
 
 
@@ -258,8 +308,10 @@ def collate(batch):
     Tracks without lyrics get a single visible zero-vector key rather than an
     all-False mask, so the row is a no-op instead of a poison pill.
     """
-    tokens = torch.stack([b["tokens"] for b in batch])
-    x, y = tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
+    # x/y are pre-split in __getitem__ (a BOS window has x != y[:-1], so we can
+    # no longer slice a single "tokens" tensor here).
+    x = torch.stack([b["x"] for b in batch]).contiguous()
+    y = torch.stack([b["y"] for b in batch]).contiguous()
 
     if all(b["ctx"] is None for b in batch):
         return {"x": x, "y": y, "ctx": None, "ctx_mask": None,

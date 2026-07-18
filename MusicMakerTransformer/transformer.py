@@ -156,9 +156,17 @@ class CausalSelfAttention(nn.Module):
         self.qkv      = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model,     bias=False)
 
-    def forward(self, x, cos, sin, kv_cache=None):
+    def forward(self, x, cos, sin, kv_cache=None, pos_offset=None):
         B, T, D = x.shape
         n_past  = kv_cache[0].shape[2] if kv_cache is not None else 0
+        # RoPE position for this token. Normally it is the cache length, but a
+        # SLIDING window breaks that: once the cache is truncated back to `keep`
+        # every new token would be rotated at ~`keep` forever, collapsing the
+        # positional distinction between successive tokens (measured: output
+        # degrades exactly when eviction starts). `pos_offset` lets the caller
+        # pass the TRUE absolute position so rotations keep advancing after an
+        # eviction. Falls back to n_past when not supplied (training, no cache).
+        offset = n_past if pos_offset is None else pos_offset
 
         qkv     = self.qkv(x)                                  # [B, T, 3D]
         q, k, v = qkv.split(self.d_model, dim=-1)
@@ -168,8 +176,8 @@ class CausalSelfAttention(nn.Module):
 
         # RoPE before the cache concat: cached k is already rotated at its own
         # absolute position, so rotating it again would double-apply.
-        q = apply_rope(q, cos, sin, offset=n_past)
-        k = apply_rope(k, cos, sin, offset=n_past)
+        q = apply_rope(q, cos, sin, offset=offset)
+        k = apply_rope(k, cos, sin, offset=offset)
 
         if kv_cache is not None:
             k = torch.cat([kv_cache[0], k], dim=2)
@@ -243,8 +251,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.ffn   = FFN(d_model, d_ff, dropout)
 
-    def forward(self, x, cos, sin, ctx=None, ctx_mask=None, kv_cache=None):
-        h, new_cache = self.attn(self.norm1(x), cos, sin, kv_cache)
+    def forward(self, x, cos, sin, ctx=None, ctx_mask=None, kv_cache=None,
+                pos_offset=None):
+        h, new_cache = self.attn(self.norm1(x), cos, sin, kv_cache, pos_offset)
         x = x + h                                              # pre-norm + residual
         if self.cross is not None and ctx is not None:
             x = x + self.cross(self.norm_x(x), ctx, ctx_mask)  # lyric conditioning
@@ -317,7 +326,7 @@ class MusicTransformer(nn.Module):
         self.register_buffer("rope_sin", sin, persistent=False)
 
     def forward(self, x, ctx=None, ctx_mask=None, kv_caches=None,
-                return_caches: bool = False):
+                return_caches: bool = False, pos_offset=None):
         """
         x:        [B, T] int64 token ids
         ctx:      [B, L, d_text] frozen T5 lyric embeddings, or None
@@ -326,9 +335,12 @@ class MusicTransformer(nn.Module):
         """
         B, T = x.shape
         n_past = kv_caches[0][0].shape[2] if kv_caches is not None else 0
-        assert n_past + T <= self.max_seq_len, (
-            f"position {n_past + T} exceeds RoPE table {self.max_seq_len}; "
-            "slide the KV cache window"
+        # With a sliding window the true position outruns the cache length, so
+        # check the position we will actually rotate at against the RoPE table.
+        rope_pos = n_past if pos_offset is None else pos_offset
+        assert rope_pos + T <= self.max_seq_len, (
+            f"position {rope_pos + T} exceeds RoPE table {self.max_seq_len}; "
+            "enlarge max_seq_len or reset the position counter"
         )
         h = self.drop(self.embedding(x))
 
@@ -348,7 +360,8 @@ class MusicTransformer(nn.Module):
                     use_reentrant=False)
             else:
                 h, c = block(h, self.rope_cos, self.rope_sin, ctx, ctx_mask,
-                             kv_caches[i] if kv_caches is not None else None)
+                             kv_caches[i] if kv_caches is not None else None,
+                             pos_offset)
             new_caches.append(c)
 
         logits = self.decoder(self.norm_out(h))

@@ -1,7 +1,7 @@
 # MusicMaker
 
-A music LM built on ZSoul's transformer. Trains on mp3/wav/flac, generates
-stereo wav/mp3/flac, conditions on lyrics from sibling `.txt` files.
+A music LM built on a hand-written transformer. Trains on mp3/wav/flac,
+generates stereo wav/mp3/flac, conditions on lyrics from sibling `.txt` files.
 
 ## How it works
 

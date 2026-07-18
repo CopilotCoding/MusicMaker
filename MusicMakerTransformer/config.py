@@ -98,11 +98,19 @@ class Config:
     # so a late gn ramp cannot compound. LAMB is famously LR-insensitive, which
     # is the property four AdamW guesses proved this project needs.
     #
-    # 3e-5 sits between the too-cold 1e-5 and the (under AdamW) too-hot 5e-5.
-    # Under LAMB the exact value matters far less; a grad-norm backoff halves it
-    # automatically if it still ramps (train.py: GradNormBackoff). This is the
-    # measured mechanism attacked directly, not a fifth guess at a magic number.
-    lr:          float = 3e-5
+    # 1e-4 under LAMB. 3e-5 was STABLE but too slow -- it held a linear
+    # -0.017/50-steps crawl through step 547 with no convex speed-up, which is
+    # the signature of an LR left too conservative. LAMB solved the divergence
+    # (gn stayed ~0.7 the whole way), so we over-insured on stability; this
+    # spends that headroom on speed.
+    #
+    # 1e-4 is deliberately aggressive: under AdamW it diverged at step 350
+    # INSTANTLY. Running it under LAMB is the direct test of the whole premise --
+    # if the trust ratio really pins each layer's step to its own norm, the LR
+    # can be 3x hotter without the ramp coming back. The GradNormBackoff net is
+    # armed to halve it if that premise is wrong. If THIS holds, the LR genuinely
+    # stopped being the fragile knob it was for four AdamW runs.
+    lr:          float = 1e-4
     # (0.9, 0.999) -- the LAMB paper's default. beta2 is the half-life of the
     # squared-gradient memory (0.999 ~= 1000 steps). Under AdamW at effective
     # batch 4 this estimate drifts and was implicated in the late gn ramp; LAMB's
