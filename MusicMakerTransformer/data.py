@@ -81,7 +81,10 @@ def cache_name(audio_path, root=None) -> str:
 
 def _sig(codec, textenc) -> dict:
     return {
-        "codec_id": codec.model_id, "bandwidth": codec.bandwidth,
+        # getattr: DacCodec has no bandwidth knob (one fixed rate); the field
+        # stays in the sig so an EnCodec-built cache can never be mistaken for
+        # a DAC one — their vocab/n_slots differ anyway, belt and suspenders.
+        "codec_id": codec.model_id, "bandwidth": getattr(codec, "bandwidth", None),
         "n_q": codec.n_q, "channels": codec.channels, "n_slots": codec.n_slots,
         "vocab_size": codec.vocab_size, "sr": codec.sr,
         "t5_id": textenc.model_id if textenc else None,

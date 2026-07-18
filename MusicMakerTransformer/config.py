@@ -98,19 +98,23 @@ class Config:
     # so a late gn ramp cannot compound. LAMB is famously LR-insensitive, which
     # is the property four AdamW guesses proved this project needs.
     #
-    # 1e-4 under LAMB. 3e-5 was STABLE but too slow -- it held a linear
-    # -0.017/50-steps crawl through step 547 with no convex speed-up, which is
-    # the signature of an LR left too conservative. LAMB solved the divergence
-    # (gn stayed ~0.7 the whole way), so we over-insured on stability; this
-    # spends that headroom on speed.
+    # 1e-3 under LAMB. The LR history, condensed:
+    #   AdamW: 3e-4 diverged @350, 5e-5 diverged @600, 1e-5 stalled. Dead end.
+    #   LAMB 3e-5: stable but a crawl (-0.017/50 steps, linear, no speed-up).
+    #   LAMB 1e-4: steepest multi-song descent yet, gn flat 0.3-0.7 to step
+    #              1400, backoff never fired.
+    #   LAMB 1e-3: MEASURED stable on the overfit test (one song, no dropout,
+    #              memorized to loss 0.005 with no clipping drama).
     #
-    # 1e-4 is deliberately aggressive: under AdamW it diverged at step 350
-    # INSTANTLY. Running it under LAMB is the direct test of the whole premise --
-    # if the trust ratio really pins each layer's step to its own norm, the LR
-    # can be 3x hotter without the ramp coming back. The GradNormBackoff net is
-    # armed to halve it if that premise is wrong. If THIS holds, the LR genuinely
-    # stopped being the fragile knob it was for four AdamW runs.
-    lr:          float = 1e-4
+    # Under LAMB the update/weight ratio pins to the LR itself, and the
+    # textbook-healthy ratio is ~1e-3 -- so this is the rule-of-thumb value,
+    # not a reckless one. Known caveat, eyes open: the 1e-3 evidence is from
+    # MEMORIZATION; generalization at effective batch 4 has noisy gradient
+    # DIRECTIONS, which the trust ratio does not average away. If that bites,
+    # the failure is not a gn ramp (backoff catches those) but a loss floor
+    # that plateaus HIGHER than 1e-4 reached at the same step -- compare
+    # against the 1e-4 run's curve, and drop back if this one is worse.
+    lr:          float = 1e-3
     # (0.9, 0.999) -- the LAMB paper's default. beta2 is the half-life of the
     # squared-gradient memory (0.999 ~= 1000 steps). Under AdamW at effective
     # batch 4 this estimate drifts and was implicated in the late gn ramp; LAMB's

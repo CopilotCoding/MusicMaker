@@ -1,0 +1,357 @@
+r"""
+overfit_one_delay.py — the delay-pattern proof: memorize ONE song, regenerate
+it, and measure the speedup over the flat interleave.
+
+    python overfit_one_delay.py --song "..\Grunge\...\track.mp3"
+
+Same test, same standard as overfit_one.py (the flat version hit 100% free-run
+match): feed the song in order as step-chunks, memorize, regenerate greedily
+from BOS, report token match + wavs + steps/s. A 10.2s window here is 515
+sequence positions instead of 4096 — the whole point being measured.
+
+Chunk layout (identical rules to the flat model, in STEPS):
+    chunk 0:  [BOSrow, g0 .. g_{S-2}]  ->  [g0 .. g_{S-1}]
+    chunk k:  [g_{kS-1} .. g_{kS+S-2}] ->  [g_{kS} .. g_{kS+S-1}]   (seam fix)
+Generation resets the KV cache every S rows, exactly as training reads.
+"""
+
+import argparse
+import math
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+import ui
+from config import CFG
+from delay import (DelayMusicTransformer, build_grid, grid_targets,
+                   slot_delays, undelay_grid)
+
+
+def sample_heads(logits, temperature: float, top_k: int):
+    """(K, cb) logits -> (K,) class ids. Per-head temp + top-k; no slot mask
+    needed — each head IS its codebook."""
+    if temperature and temperature > 0.02:
+        lg = logits / temperature
+        if top_k and top_k < lg.shape[-1]:
+            kth = lg.topk(top_k, dim=-1).values[..., -1:]
+            lg = lg.masked_fill(lg < kth, float("-inf"))
+        return torch.multinomial(lg.softmax(-1), 1)[:, 0]
+    return logits.argmax(-1)
+
+
+@torch.no_grad()
+def gen_rows(model, n_rows, S, bos_row, delays, pad, codebook_sz,
+             prime=None, temperature=0.01, top_k=1, device="cuda",
+             frame_rate=50.0):
+    """Chunk-aligned row generation mirroring training layout exactly.
+
+    prime: (P, K) real grid rows to continue from (song start), or None.
+    Returns (n_total_rows, K) banded grid including any prime.
+    """
+    K = len(delays)
+    model.eval()
+    prime = prime if prime is not None else torch.zeros((0, K), dtype=torch.long)
+    P = prime.shape[0]
+
+    # prefill in training-layout pieces, fresh cache per piece
+    pieces = [torch.cat([bos_row[None], prime[:min(P, S - 1)]], dim=0)]
+    p = S - 1
+    while p < P:
+        pieces.append(prime[p:p + S])
+        p += S
+    # bf16 autocast to MATCH training numerics: the model memorized under
+    # autocast, and at 18 heads/row a borderline fp32-vs-bf16 argmax flip
+    # anywhere derails the whole autoregressive rollout.
+    amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda"))
+    caches = None
+    for piece in pieces:
+        with amp:
+            lg, caches = model(piece[None].to(device), kv_caches=None,
+                               return_caches=True, pos_offset=0)
+    cache_len = pieces[-1].shape[0]
+
+    rows = [r for r in prime]
+    prog = ui.gen_progress()
+    task = prog.add_task("rows", total=n_rows, stats="") if prog else None
+    if prog:
+        prog.start()
+    for i in range(n_rows):
+        s = P + i                                   # absolute row index
+        cls = sample_heads(lg[0, -1].float(), temperature, top_k).cpu()  # (K,)
+        row = cls + torch.arange(K) * codebook_sz   # band the ids (all CPU)
+        # structural PADs at the song-start stagger: slot k has no token
+        # before row delay_k. Training masked these; generation imposes them.
+        for k in range(K):
+            if s < delays[k]:
+                row[k] = pad
+        rows.append(row)
+        if i + 1 < n_rows:
+            if cache_len >= S:                      # chunk boundary: reset,
+                caches = None                       # exactly like training
+                cache_len = 0
+            with amp:
+                lg, caches = model(row[None, None].to(device), kv_caches=caches,
+                                   return_caches=True, pos_offset=cache_len)
+            cache_len += 1
+        if prog:
+            prog.update(task, completed=i + 1,
+                        stats=f"[bold]{(P+i+1)/frame_rate:.1f}s[/] audio")
+    if prog:
+        prog.stop()
+    return torch.stack(rows)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--song", required=True)
+    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--seq-steps", type=int, default=512,
+                    help="window in TIMESTEPS. 512 = 10.24s = the same audio "
+                         "the flat test's 4096 tokens covered, in 1/8 the "
+                         "sequence positions.")
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--gen-seconds", type=float, default=15.0)
+    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    ap.add_argument("--codec", choices=["dac", "encodec"], default="dac",
+                    help="dac = 44.1kHz ~8kbps (measured: 'basically the "
+                         "original'); encodec = the old 2.2kbps ceiling")
+    ap.add_argument("--target-acc", type=float, default=99.99,
+                    help="polish every chunk to this teacher-forced accuracy "
+                         "before generating — the bar 100%% free-run needs")
+    ap.add_argument("--polish", type=int, default=6000,
+                    help="max extra steps spent on weak chunks after --steps")
+    a = ap.parse_args()
+
+    song = Path(a.song)
+    if not song.exists():
+        raise SystemExit(f"no such file: {song}")
+    dev = ("cuda" if torch.cuda.is_available() else "cpu") \
+        if a.device == "auto" else a.device
+
+    import transformers
+    transformers.logging.set_verbosity_error()
+    from dac_codec import make_codec
+    from optim import Lamb
+    import audio_io
+
+    out_dir = Path(__file__).parent
+    stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in song.stem)[:40]
+
+    ui.rule(f"overfit-one, DELAY PATTERN — codec: {a.codec}")
+    codec = make_codec(a.codec, dev)
+    n_q, C, cb = codec.n_q, codec.channels, codec.codebook_sz
+    K = n_q * C
+    fr = codec.frame_rate
+    delays = slot_delays(n_q, C)
+
+    # per-codec cache: DAC and EnCodec tokens are different worlds — never mix
+    from data import cache_name
+    cdir = out_dir / "_overfit_cache"
+    cdir.mkdir(exist_ok=True)
+    suffix = "" if a.codec == "encodec" else f"__{a.codec}"
+    npz = cdir / f"{cache_name(song, song.parent)}{suffix}.npz"
+    if npz.exists():
+        ui.log("[dim]song already cached — reusing[/]")
+        flat = torch.from_numpy(np.load(npz)["codes"].astype(np.int64))
+    else:
+        flat = codec.encode_file(song).long()
+        np.savez(npz, codes=flat.numpy().astype(np.int16))
+    codes = codec.unflatten(flat[None])[0]            # (n_q, C, T)
+    T = codes.shape[-1]
+
+    grid = build_grid(codes, cb, codec.pad)           # (T+n_q-1, K)
+    tgt = grid_targets(grid, cb)                      # class ids / -100
+    S = a.seq_steps
+    G = grid.shape[0]
+
+    # Pad the grid out to whole windows: a song SHORTER than the window (the
+    # whole-song-in-one-context case, and every short track in the pretrain)
+    # fills its tail with PAD rows, masked (-100) out of the loss. This is the
+    # exact path the real training data pipeline uses for short tracks.
+    W = max(1, math.ceil(G / S))
+    L = W * S
+    if L > G:
+        pad_rows = torch.full((L - G, K), codec.pad, dtype=torch.long)
+        grid = torch.cat([grid, pad_rows])
+        tgt = torch.cat([tgt, torch.full((L - G, K), -100, dtype=torch.long)])
+
+    # in-order chunks with BOS + seam, in steps
+    bos_row = torch.full((K,), codec.bos, dtype=torch.long)
+    chunks = []
+    x0 = torch.cat([bos_row[None], grid[:S - 1]], dim=0)
+    chunks.append((x0, tgt[:S]))
+    for k in range(1, W):
+        chunks.append((grid[k * S - 1: k * S + S - 1], tgt[k * S: k * S + S]))
+
+    model = DelayMusicTransformer(
+        vocab_size=codec.vocab_size, d_model=CFG.d_model, n_heads=CFG.n_heads,
+        n_layers=CFG.n_layers, d_ff=CFG.d_ff,
+        max_seq_len=max(S, 2048), n_slots=K, codebook_sz=cb,
+        dropout=0.0, d_text=None, rope_base=CFG.rope_base,
+        grad_checkpoint=CFG.grad_checkpoint,
+    ).to(dev)
+    opt = Lamb(model.parameters(), lr=a.lr, betas=CFG.betas, weight_decay=0.0)
+
+    ui.kv_table([
+        ("song", f"{song.name}  ({T/fr:.0f}s, {T} frames)"),
+        ("codec", f"{a.codec}: {n_q}x{cb} @ {fr:.1f} fps, vocab {codec.vocab_size}"),
+        ("window", f"{S} steps = {S/fr:.1f}s audio  "
+                   f"[dim](flat needed {S*K} positions for this)[/]"),
+        ("chunks", f"{len(chunks)} in-order"),
+        ("model", f"{model.count_parameters()/1e6:.1f}M params, {K} heads"),
+        ("device", dev),
+    ])
+
+    # ---- memorize ----
+    model.train()
+    t0 = time.time()
+    prog = ui.train_progress()
+    task = prog.add_task("memorizing", total=a.steps, stats="") if prog else None
+    if prog:
+        prog.start()
+    last = 99.0
+    for step in range(a.steps):
+        cx, cy = chunks[step % len(chunks)]
+        x = cx[None].to(dev); y = cy[None].to(dev)
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
+            lg = model(x)                                    # (1, S, K, cb)
+            loss = F.cross_entropy(lg.reshape(-1, cb), y.reshape(-1),
+                                   ignore_index=-100)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
+        opt.step()
+        last = loss.item()
+        if prog:
+            prog.update(task, completed=step + 1,
+                        stats=f"loss [bold]{last:.4f}[/] "
+                              f"[dim]{(step+1)/(time.time()-t0):.2f} steps/s[/]")
+    if prog:
+        prog.stop()
+    dt = time.time() - t0
+    sps = a.steps / dt
+    ui.log(f"[green]memorized[/] — loss [bold]{last:.4f}[/] in {dt:.0f}s "
+           f"= [bold]{sps:.2f} steps/s[/]")
+
+    # ---- teacher-forced audit + polish-to-target ----
+    # The training-loop loss is only the LAST chunk's. A single weak chunk
+    # poisons free-run: one wrong token and the rollout leaves the rails, and
+    # at 18 tokens/row the per-row error rate is acc^18 — 99.95% mean accuracy
+    # still means a slip every ~11 rows. The EnCodec test's 100% match needed
+    # ~99.99%+; DAC needs the same, so we TRAIN TO TARGET: audit every chunk,
+    # retrain only the weak ones, repeat until all clear --target-acc.
+    def audit(only=None):
+        model.eval()
+        idxs = range(len(chunks)) if only is None else only
+        out = {}
+        with torch.no_grad():
+            for ci in idxs:
+                cx, cy = chunks[ci]
+                with torch.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=(dev == "cuda")):
+                    lg = model(cx[None].to(dev))
+                pred = lg[0].float().argmax(-1)
+                yy = cy.to(dev)
+                m = yy != -100
+                out[ci] = 100.0 * (pred[m] == yy[m]).float().mean().item()
+        model.train()
+        return out
+
+    accs = audit()
+    used = 0
+    while used < a.polish:
+        weak = [ci for ci, v in accs.items() if v < a.target_acc]
+        if not weak:
+            break
+        for ci in weak:                       # a focused pass over weak chunks
+            for _ in range(10):
+                if used >= a.polish:
+                    break
+                cx, cy = chunks[ci]
+                x = cx[None].to(dev); y = cy[None].to(dev)
+                opt.zero_grad(set_to_none=True)
+                with torch.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=(dev == "cuda")):
+                    lg = model(x)
+                    loss = F.cross_entropy(lg.reshape(-1, cb), y.reshape(-1),
+                                           ignore_index=-100)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
+                opt.step()
+                used += 1
+        accs.update(audit(weak))
+    worst = min(accs, key=accs.get)
+    ui.kv_table([
+        ("mean acc", f"{sum(accs.values())/len(accs):.3f}%  (teacher-forced)"),
+        ("worst chunk", f"#{worst}: {accs[worst]:.3f}%  "
+                        f"(target {a.target_acc}%)"),
+        ("polish", f"{used} extra steps on weak chunks"
+                   + ("  [yellow](cap hit — raise --polish)[/]"
+                      if used >= a.polish and accs[worst] < a.target_acc else "")),
+        ("verdict", "[green]all chunks at target[/]"
+                    if accs[worst] >= a.target_acc else
+                    f"[bold red]below target — free-run will slip near "
+                    f"chunk #{worst}[/]"),
+    ], title="memorization audit")
+
+    # ---- regenerate ----
+    ui.rule("regenerating from the real start")
+    n_frames = min(int(a.gen_seconds * fr), T)
+    n_rows = n_frames + n_q - 1
+
+    free = gen_rows(model, n_rows, S, bos_row, delays, codec.pad, cb,
+                    prime=None, device=dev, frame_rate=fr)
+    codes_f = undelay_grid(free[:n_rows], n_q, C, cb)
+    m_free = 100.0 * (codes_f == codes[:, :, :n_frames]).float().mean().item()
+
+    P = int(5 * fr)                                   # 5s prime, in rows
+    cont = gen_rows(model, n_rows - P, S, bos_row, delays, codec.pad, cb,
+                    prime=grid[:P], device=dev, frame_rate=fr)
+    codes_c = undelay_grid(cont, n_q, C, cb)
+    new_f = codes_c.shape[-1] - (P - (n_q - 1))       # frames beyond the prime
+    cc = codes_c[:, :, -new_f:]
+    rr = codes[:, :, codes_c.shape[-1] - new_f: codes_c.shape[-1]]
+    m_cont = 100.0 * (cc == rr).float().mean().item()
+
+    # ---- decode to wavs ----
+    def to_flat(c):
+        return codec.flatten(c[None].to(codec.device))[0]
+    real_wav = codec.decode_flat(to_flat(codes[:, :, :n_frames])[None])
+    free_wav = codec.decode_flat(to_flat(codes_f)[None])
+    cont_wav = codec.decode_flat(to_flat(codes_c)[None])
+    p_real = out_dir / f"{stem}__dly_real.wav"
+    p_free = out_dir / f"{stem}__dly_freerun.wav"
+    p_cont = out_dir / f"{stem}__dly_primed.wav"
+    audio_io.save(real_wav.cpu(), p_real, codec.sr)
+    audio_io.save(free_wav.cpu(), p_free, codec.sr)
+    audio_io.save(cont_wav.cpu(), p_cont, codec.sr)
+
+    chance = 100.0 / cb
+    ui.rule("verdict")
+    ui.kv_table([
+        ("free-run match", f"[bold]{m_free:.1f}%[/]  (chance {chance:.3f}%)"),
+        ("primed match", f"[bold]{m_cont:.1f}%[/]  (continuation only)"),
+        ("throughput", f"[bold]{sps:.2f} steps/s[/] at a {S}-step window"),
+        ("real", str(p_real.name)),
+        ("free-run", str(p_free.name)),
+        ("primed", str(p_cont.name)),
+    ], title="delay pattern: did it memorize?")
+    if m_free > 80:
+        ui.panel("[bold green]DELAY PATTERN VERIFIED[/] — memorized and "
+                 "regenerated through the parallel heads, delay stagger, "
+                 "chunk resets and undelay. The architecture is sound; "
+                 "full-song context (16384 steps = 327s) is now on the table.",
+                 title="green light", style="green")
+    else:
+        ui.panel("[bold red]DID NOT REPRODUCE[/] — loss low but match poor "
+                 "means the generation path (row layout / delay alignment / "
+                 "cache resets) disagrees with training. Check the stagger "
+                 "and the structural PADs first.", title="red flag",
+                 style="red")
+
+
+if __name__ == "__main__":
+    main()

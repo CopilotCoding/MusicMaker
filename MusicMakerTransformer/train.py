@@ -61,13 +61,19 @@ class GradNormBackoff:
     """
 
     def __init__(self, lr_scale, window=40, ratio=1.5, floor=1.0,
-                 cooldown=60, min_scale=0.01):
+                 cooldown=60, min_scale=0.01, abs_fire=None):
         self.lr_scale = lr_scale          # shared {"v": float} the sched reads
         self.window = window
         self.ratio = ratio
         self.floor = floor
         self.cooldown = cooldown
         self.min_scale = min_scale
+        # PRODUCTION LESSON (full 1e-3 run): the relative trigger deafens as
+        # its own fires raise the baseline — by the 4th fire, gn spikes of 15+
+        # sat below the 1.5x-of-baseline bar. abs_fire ORs in an absolute
+        # tripwire: recent mean above this fires regardless of trend. None
+        # preserves the original behavior.
+        self.abs_fire = abs_fire
         self.hist = []
         self.since_fire = 10 ** 9
 
@@ -80,11 +86,13 @@ class GradNormBackoff:
             return None
         recent = sum(self.hist[-w:]) / w
         older = sum(self.hist[-2 * w:-w]) / w
-        if recent > older * self.ratio and recent > self.floor \
-                and self.lr_scale["v"] > self.min_scale:
+        trend = recent > older * self.ratio and recent > self.floor
+        absolute = self.abs_fire is not None and recent > self.abs_fire
+        if (trend or absolute) and self.lr_scale["v"] > self.min_scale:
             self.lr_scale["v"] *= 0.5
             self.since_fire = 0
-            return (f"grad-norm ramp: {older:.2f} -> {recent:.2f} over "
+            why = "ramp" if trend else f"abs>{self.abs_fire:.0f}"
+            return (f"grad-norm {why}: {older:.2f} -> {recent:.2f} over "
                     f"{w} steps. LR halved (scale now {self.lr_scale['v']:.3f}).")
         return None
 
