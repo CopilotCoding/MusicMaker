@@ -180,10 +180,17 @@ def main():
                 continue                      # failed shard: logged, skip
             ex_dir = TMP / f"x{i:02d}"
             with tarfile.open(tar_p) as tf:
-                tf.extractall(ex_dir)
+                tf.extractall(ex_dir, filter="data")
             mp3s = sorted(ex_dir.rglob("*.mp3"))
 
-            for mp3 in mp3s:
+            for j, mp3 in enumerate(mp3s):
+                # per-TRACK progress: a shard is ~185 tracks / ~20 min of
+                # encoding, and a bar that only moves per shard looks frozen
+                # the whole time (measured: it did).
+                if prog:
+                    prog.update(task, completed=done_shards + j / max(1, len(mp3s)),
+                                stats=f"shard {i:02d}: track {j+1}/{len(mp3s)} "
+                                      f"| [bold]{man['hours']:.1f}h[/] cached")
                 name = f"jam_{mp3.stem}"
                 npz = CACHE / f"{name}.npz"
                 if name in man["tracks"] and npz.exists():

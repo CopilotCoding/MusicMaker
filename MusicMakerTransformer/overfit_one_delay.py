@@ -132,6 +132,12 @@ def main():
                          "default (constant LR + median stop + one annealed "
                          "consolidation) measured 100%% free-run; use this if "
                          "a song's audit won't converge on the default path")
+    ap.add_argument("--auto", action="store_true",
+                    help="experimental probe-up/back-off LR controller: rides "
+                         "the LR up 5%% while full-pass mean loss keeps "
+                         "improving, backs off 30%% when it doesn't — anneals "
+                         "itself at convergence. Racing against the default; "
+                         "not yet the champion")
     a = ap.parse_args()
 
     song = Path(a.song)
@@ -270,18 +276,42 @@ def main():
 
     if a.cycles:
         # OPTIONAL SGDR mode: high/medium/low warm-restart cycles, audit
-        # between cycles, repeat until every chunk clears the target.
+        # between cycles, repeat until the audit clears — with three guards
+        # all MEASURED necessary:
+        #  1. DECAYING RESTARTS: once the audit is nearly converged, a full
+        #     high-LR restart destroys the converged state (measured: cycle 24
+        #     was 1-below-target, cycle 25's 1e-3 pass wrecked 31 chunks).
+        #     Near convergence the high phase is skipped; very near, medium
+        #     too — late cycles ARE anneals.
+        #  2. NEVER END MID-HIGH: a cycle only starts if the step budget can
+        #     finish it (the cap once landed mid-high-phase and the run ended
+        #     with the model at its most disrupted -> free-run 1.5%).
+        #  3. STAGNATION STOP: if the below-target count stops improving for
+        #     3 cycles, the residue is alias-unfittable — accept and stop
+        #     instead of looping forever (this is cycle mode's early stop).
         PHASES = ((a.lr, 6), (a.lr / 10, 2), (a.lr / 100, 2))
         cycle = 0
+        prev_below, stagnant = None, 0
         while steps_done < a.steps:
             cycle += 1
-            for lr_c, passes in PHASES:
+            phases = PHASES
+            if accs:
+                mean_acc = sum(accs.values()) / len(accs)
+                if mean_acc >= 99.98:
+                    phases = PHASES[2:]      # consolidation only
+                elif mean_acc >= 99.9:
+                    phases = PHASES[1:]      # no high restart near convergence
+            need = sum(p for _, p in phases) * len(chunks)
+            if steps_done + need > a.steps:
+                ui.log(f"[dim]stopping: {a.steps - steps_done} steps left "
+                       f"< one full cycle ({need}) — refusing to end "
+                       f"mid-phase[/]")
+                break
+            for lr_c, passes in phases:
                 for g in opt.param_groups:
                     g["lr"] = lr_c
                 for _ in range(passes):
                     for ci in range(len(chunks)):
-                        if steps_done >= a.steps:
-                            break
                         train_chunk(ci)
                         steps_done += 1
                         if prog:
@@ -293,7 +323,7 @@ def main():
             n_below = sum(1 for v in accs.values() if v < a.target_acc)
             if prog:
                 prog.stop()
-            ui.log(f"[dim]cycle {cycle}: mean "
+            ui.log(f"[dim]cycle {cycle} ({len(phases)} phases): mean "
                    f"{sum(accs.values())/len(accs):.3f}% "
                    f"worst {min(accs.values()):.3f}%  {n_below} below target  "
                    f"({steps_done} steps)[/]")
@@ -301,6 +331,75 @@ def main():
                 prog.start()
             if n_below == 0:
                 break
+            if prev_below is not None and n_below >= prev_below:
+                stagnant += 1
+                if stagnant >= 3:
+                    ui.log(f"[yellow]{n_below} chunk(s) stagnant for 3 cycles "
+                           f"— accepting as alias-unfittable residue[/]")
+                    break
+            else:
+                stagnant = 0
+            prev_below = n_below
+    elif a.auto:
+        # EXPERIMENTAL probe-up/back-off controller. The unit of comparison is
+        # one full in-order pass over ALL chunks — same chunks, same order, so
+        # consecutive pass-means are like-for-like. (Per-step loss is NOT: it
+        # reflects chunk difficulty, the confound that breaks naive
+        # smoothness controllers.) Rule: pass-mean improved -> lr *= 1.05;
+        # didn't -> lr *= 0.7. At convergence passes stop improving by
+        # definition, so the controller backs off repeatedly: it ANNEALS
+        # ITSELF. Audit every 5 passes decides done/stagnant.
+        lr_now = a.lr
+        LO, HI = a.lr / 1000, a.lr * 3
+        prev_mean = None
+        pass_n = 0
+        prev_below, stagnant = None, 0
+        while steps_done < a.steps:
+            pass_n += 1
+            for g in opt.param_groups:
+                g["lr"] = lr_now
+            tot = 0.0
+            for ci in range(len(chunks)):
+                train_chunk(ci)
+                steps_done += 1
+                tot += last
+                if prog:
+                    prog.update(task, completed=steps_done, stats=(
+                        f"pass {pass_n} lr [bold]{lr_now:.2e}[/] "
+                        f"loss {last:.4f} "
+                        f"[dim]{steps_done/(time.time()-t0):.1f} st/s[/]"))
+            mean = tot / len(chunks)
+            if prev_mean is None or mean < prev_mean:
+                lr_now = min(lr_now * 1.05, HI)      # improving: probe up
+            else:
+                lr_now = max(lr_now * 0.7, LO)       # worse: back off hard
+            prev_mean = mean
+            if pass_n % 5 == 0 or lr_now <= LO * 1.001:
+                accs = audit()
+                n_below = sum(1 for v in accs.values() if v < a.target_acc)
+                if prog:
+                    prog.stop()
+                ui.log(f"[dim]pass {pass_n}: lr {lr_now:.2e} "
+                       f"pass-mean {mean:.4f}  worst {min(accs.values()):.3f}% "
+                       f"{n_below} below  ({steps_done} steps)[/]")
+                if prog:
+                    prog.start()
+                if n_below == 0:
+                    break
+                if lr_now <= LO * 1.001:
+                    ui.log("[yellow]LR self-annealed to floor — accepting[/]")
+                    break
+                if prev_below is not None and n_below >= prev_below:
+                    stagnant += 1
+                    if stagnant >= 3:
+                        ui.log(f"[yellow]{n_below} chunk(s) stagnant for 3 "
+                               f"audits — accepting as unfittable residue[/]")
+                        break
+                else:
+                    stagnant = 0
+                prev_below = n_below
+        if not accs:
+            accs = audit()
     else:
         # DEFAULT path — MEASURED 100% free-run on the DAC test: constant LR
         # with a median early-stop, then one annealed consolidation.
