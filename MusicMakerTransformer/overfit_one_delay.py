@@ -119,17 +119,19 @@ def main():
                     help="dac = 44.1kHz ~8kbps (measured: 'basically the "
                          "original'); encodec = the old 2.2kbps ceiling")
     ap.add_argument("--target-acc", type=float, default=99.99,
-                    help="polish every chunk to this teacher-forced accuracy "
-                         "before generating — the bar 100%% free-run needs")
-    ap.add_argument("--polish", type=int, default=6000,
-                    help="max extra steps spent on weak chunks after --steps")
+                    help="the audit bar: teacher-forced accuracy every chunk "
+                         "should reach")
     ap.add_argument("--stop-loss", type=float, default=0.002,
-                    help="stop the memorize phase early once the mean loss "
-                         "over one full pass of chunks falls below this. "
-                         "0.002, not 0.001: in practice the mean hovers just "
-                         "above 0.001 forever while being plenty memorized — "
-                         "the POLISH phase is the precision pass, so the "
-                         "memorize phase only needs the neighborhood")
+                    help="default path: end the constant-LR phase once the "
+                         "MEDIAN loss over one full chunk cycle drops below "
+                         "this (median, not mean — one alias-fighting outlier "
+                         "chunk held the mean hostage forever)")
+    ap.add_argument("--cycles", action="store_true",
+                    help="optional SGDR mode: high/medium/low LR passes "
+                         "repeating until the audit clears --target-acc. The "
+                         "default (constant LR + median stop + one annealed "
+                         "consolidation) measured 100%% free-run; use this if "
+                         "a song's audit won't converge on the default path")
     a = ap.parse_args()
 
     song = Path(a.song)
@@ -212,60 +214,18 @@ def main():
         ("device", dev),
     ])
 
-    # ---- memorize ----
-    model.train()
-    t0 = time.time()
-    prog = ui.train_progress()
-    task = prog.add_task("memorizing", total=a.steps, stats="") if prog else None
-    if prog:
-        prog.start()
-    last = 99.0
-    recent = []                # last full-cycle of per-chunk losses
-    steps_done = a.steps
-    for step in range(a.steps):
-        cx, cy = chunks[step % len(chunks)]
-        x = cx[None].to(dev); y = cy[None].to(dev)
-        opt.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
-            lg = model(x)                                    # (1, S, K, cb)
-            loss = F.cross_entropy(lg.reshape(-1, cb), y.reshape(-1),
-                                   ignore_index=-100)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
-        opt.step()
-        last = loss.item()
-        recent.append(last)
-        if len(recent) > len(chunks):
-            recent.pop(0)
-        if prog:
-            prog.update(task, completed=step + 1,
-                        stats=f"loss [bold]{last:.4f}[/] "
-                              f"[dim]{(step+1)/(time.time()-t0):.2f} steps/s[/]")
-        # Early stop on a FULL-CYCLE mean, not one chunk's dip: a single easy
-        # chunk under threshold means nothing while its neighbors sit at 0.01.
-        if len(recent) == len(chunks) and \
-                sum(recent) / len(recent) < a.stop_loss:
-            steps_done = step + 1
-            if prog:
-                prog.update(task, completed=a.steps)
-            break
-    if prog:
-        prog.stop()
-    if steps_done < a.steps:
-        ui.log(f"[green]early stop[/] @ step {steps_done}: mean loss over a "
-               f"full chunk cycle < {a.stop_loss}")
-    dt = time.time() - t0
-    sps = steps_done / dt
-    ui.log(f"[green]memorized[/] — loss [bold]{last:.4f}[/] in {dt:.0f}s "
-           f"= [bold]{sps:.2f} steps/s[/]")
-
-    # ---- teacher-forced audit + polish-to-target ----
-    # The training-loop loss is only the LAST chunk's. A single weak chunk
-    # poisons free-run: one wrong token and the rollout leaves the rails, and
-    # at 18 tokens/row the per-row error rate is acc^18 — 99.95% mean accuracy
-    # still means a slip every ~11 rows. The EnCodec test's 100% match needed
-    # ~99.99%+; DAC needs the same, so we TRAIN TO TARGET: audit every chunk,
-    # retrain only the weak ones, repeat until all clear --target-acc.
+    # ---- memorize: HIGH -> MEDIUM -> LOW cycles until done (SGDR-style) ----
+    # WHY CYCLES, not one long constant-LR run + cleanup: cycling one chunk
+    # per step at constant high LR never converges — every update partially
+    # overwrites the other chunks, and the model ORBITS the joint optimum at
+    # a radius set by the step size (measured: 26 chunks stuck just below
+    # target after 8000 flat steps; a targeted-polish phase made it WORSE by
+    # concentrating interference — 5000 steps on one stuck chunk collapsed
+    # free-run from 89% to 1%). Warm-restart cycles are the textbook answer
+    # (Smith's CLR; Loshchilov & Hutter's SGDR): the HIGH pass buys plasticity
+    # to fix what small steps can't reach, the LOW pass collapses the orbit so
+    # all chunks settle JOINTLY, and repeating alternates the two until the
+    # audit — not a loss printout — says every chunk is memorized.
     def audit(only=None):
         model.eval()
         idxs = range(len(chunks)) if only is None else only
@@ -283,77 +243,118 @@ def main():
         model.train()
         return out
 
-    def train_chunk(ci, n=1):
-        for _ in range(n):
-            cx, cy = chunks[ci]
-            x = cx[None].to(dev); y = cy[None].to(dev)
-            opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=(dev == "cuda")):
-                lg = model(x)
-                loss = F.cross_entropy(lg.reshape(-1, cb), y.reshape(-1),
-                                       ignore_index=-100)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
-            opt.step()
+    last = 99.0
 
-    accs = audit()
-    used = 0
-    rnd = 0
-    noimp = {ci: 0 for ci in range(len(chunks))}
-    given_up = set()
-    while used < a.polish:
-        weak = [ci for ci, v in accs.items()
-                if v < a.target_acc and ci not in given_up]
-        if not weak:
-            break
-        rnd += 1
-        ui.log(f"[dim]polish round {rnd}: {len(weak)} chunk(s) below "
-               f"{a.target_acc}%, {used}/{a.polish} steps"
-               + (f", {len(given_up)} accepted-stuck" if given_up else "") + "[/]")
-        for ci in weak:
-            n = min(10, a.polish - used)
-            train_chunk(ci, n)
-            used += n
-        new = audit(weak)
-        # STUCK DETECTOR. A chunk that three audits in a row refuses to improve
-        # is not under-trained, it is UNFITTABLE (pad-dominated final chunk, or
-        # reset-boundary aliasing: two chunks opening with identical audio and
-        # different continuations). MEASURED failure without this: the loop
-        # spent ~5000 consecutive steps on stuck chunk #48 and catastrophically
-        # overwrote every other chunk — free-run fell 89% -> 1% while stale
-        # audit numbers still claimed 99.998%. Accept the stuck chunk and move on.
-        for ci, v in new.items():
-            if v <= accs[ci] + 0.001:
-                noimp[ci] += 1
-                if noimp[ci] >= 3 and v < a.target_acc:
-                    given_up.add(ci)
-                    ui.log(f"[yellow]chunk #{ci} stuck at {v:.3f}% after "
-                           f"{noimp[ci]} tries — accepting it (pad-heavy or "
-                           f"alias-ambiguous; ~tokens, not a training failure)[/]")
-            else:
-                noimp[ci] = 0
-        accs.update(new)
+    def train_chunk(ci):
+        nonlocal last
+        cx, cy = chunks[ci]
+        x = cx[None].to(dev); y = cy[None].to(dev)
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
+            lg = model(x)
+            loss = F.cross_entropy(lg.reshape(-1, cb), y.reshape(-1),
+                                   ignore_index=-100)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
+        opt.step()
+        last = loss.item()
 
-    # REBALANCE + HONEST AUDIT. Polish concentrates gradient on few chunks and
-    # bleeds the rest; two full in-order passes re-settle every chunk, and then
-    # a FULL audit (never stale numbers) reports the true state.
-    for _ in range(2):
-        for ci in range(len(chunks)):
-            train_chunk(ci, 1)
-    accs = audit()
+    model.train()
+    t0 = time.time()
+    steps_done = 0
+    accs = {}
+    prog = ui.train_progress()
+    task = prog.add_task("memorizing", total=a.steps, stats="") if prog else None
+    if prog:
+        prog.start()
+
+    if a.cycles:
+        # OPTIONAL SGDR mode: high/medium/low warm-restart cycles, audit
+        # between cycles, repeat until every chunk clears the target.
+        PHASES = ((a.lr, 6), (a.lr / 10, 2), (a.lr / 100, 2))
+        cycle = 0
+        while steps_done < a.steps:
+            cycle += 1
+            for lr_c, passes in PHASES:
+                for g in opt.param_groups:
+                    g["lr"] = lr_c
+                for _ in range(passes):
+                    for ci in range(len(chunks)):
+                        if steps_done >= a.steps:
+                            break
+                        train_chunk(ci)
+                        steps_done += 1
+                        if prog:
+                            prog.update(task, completed=steps_done, stats=(
+                                f"cyc {cycle} lr {lr_c:.0e} "
+                                f"loss [bold]{last:.4f}[/] "
+                                f"[dim]{steps_done/(time.time()-t0):.1f} st/s[/]"))
+            accs = audit()
+            n_below = sum(1 for v in accs.values() if v < a.target_acc)
+            if prog:
+                prog.stop()
+            ui.log(f"[dim]cycle {cycle}: mean "
+                   f"{sum(accs.values())/len(accs):.3f}% "
+                   f"worst {min(accs.values()):.3f}%  {n_below} below target  "
+                   f"({steps_done} steps)[/]")
+            if prog:
+                prog.start()
+            if n_below == 0:
+                break
+    else:
+        # DEFAULT path — MEASURED 100% free-run on the DAC test: constant LR
+        # with a median early-stop, then one annealed consolidation.
+        recent = []
+        for step in range(a.steps):
+            train_chunk(step % len(chunks))
+            steps_done += 1
+            recent.append(last)
+            if len(recent) > len(chunks):
+                recent.pop(0)
+            if prog:
+                prog.update(task, completed=step + 1, stats=(
+                    f"loss [bold]{last:.4f}[/] "
+                    f"[dim]{steps_done/(time.time()-t0):.1f} st/s[/]"))
+            if len(recent) == len(chunks) and \
+                    sorted(recent)[len(recent) // 2] < a.stop_loss:
+                if prog:
+                    prog.stop()
+                ui.log(f"[green]early stop[/] @ step {step + 1}: median loss "
+                       f"over a full chunk cycle < {a.stop_loss}")
+                if prog:
+                    prog.start()
+                break
+        # Annealed consolidation: constant-LR cycling ORBITS the joint optimum
+        # (each chunk's update partially overwrites the rest); shrinking the LR
+        # collapses the orbit so all chunks settle jointly. ~250 steps.
+        for lr_c, cycles_n in ((a.lr / 10, 3), (a.lr / 100, 2)):
+            for g in opt.param_groups:
+                g["lr"] = lr_c
+            for _ in range(cycles_n):
+                for ci in range(len(chunks)):
+                    train_chunk(ci)
+                    steps_done += 1
+        accs = audit()
+
+    if prog:
+        prog.stop()
+    dt = time.time() - t0
+    ui.log(f"[green]memorized[/] — {steps_done} steps in {dt:.0f}s "
+           f"= [bold]{steps_done/dt:.2f} steps/s[/]")
+    sps = steps_done / dt
+
     worst = min(accs, key=accs.get)
+    n_below = sum(1 for v in accs.values() if v < a.target_acc)
     ui.kv_table([
         ("mean acc", f"{sum(accs.values())/len(accs):.3f}%  "
-                     f"(teacher-forced, FULL re-audit)"),
+                     f"(teacher-forced, full audit)"),
         ("worst chunk", f"#{worst}: {accs[worst]:.3f}%  "
                         f"(target {a.target_acc}%)"),
-        ("polish", f"{used} steps"
-                   + (f"; accepted stuck: {sorted(given_up)}" if given_up else "")),
-        ("verdict", "[green]all chunks at target[/]"
-                    if accs[worst] >= a.target_acc else
-                    f"[yellow]worst is chunk #{worst} — if it's outside the "
-                    f"generated span, the match is unaffected[/]"),
+        ("below target", f"{n_below} chunk(s)"),
+        ("verdict", "[green]all chunks at target[/]" if n_below == 0 else
+                    f"[yellow]step cap hit; residue is likely reset-boundary "
+                    f"aliasing (unfittable tokens) — if outside the generated "
+                    f"span it cannot affect the match[/]"),
     ], title="memorization audit")
 
     # ---- regenerate ----

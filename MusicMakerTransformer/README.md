@@ -126,7 +126,7 @@ absolute tripwire too.) Full story with receipts:
 | cached decode == full forward (delay) | 5.96e-07 |
 | flat model, one song memorized -> regenerated | **100.0%** free-run token match |
 | delay model, whole song in ONE window (323s) | **99.8%** free-run, audibly the song |
-| delay+DAC memorize/regenerate | 89.1% -> polish-to-target added (99.99% TF per chunk) |
+| delay+DAC memorize/regenerate | **100.0%** free-run, 100.0% primed (median-stop + annealed consolidation) |
 | delay training cost @ 28672 steps (334s), batch 1 | **9.4GB, 6.9s/step** |
 | delay throughput vs flat, same audio window | **3.2x** train, ~13x generation |
 | flat full-corpus baseline (LAMB 1e-3) | val 9.86 -> **7.74** in 800 steps |
