@@ -128,6 +128,7 @@ absolute tripwire too.) Full story with receipts:
 | delay model, whole song in ONE window (323s) | **99.8%** free-run, audibly the song |
 | delay+DAC memorize/regenerate | **100.0%** free-run, 100.0% primed (median-stop + annealed consolidation, ~5,240 steps) |
 | same, `--auto` adaptive-LR controller | **100.0%** free-run in **4,165 steps** — probe-up/back-off, self-annealed 2.65e-3 → 4e-6, zero knobs |
+| same, `--cycles` guarded SGDR | 100.0% free-run in 6,860 steps — works, slowest of the three |
 | delay training cost @ 28672 steps (334s), batch 1 | **9.4GB, 6.9s/step** |
 | delay throughput vs flat, same audio window | **3.2x** train, ~13x generation |
 | flat full-corpus baseline (LAMB 1e-3) | val 9.86 -> **7.74** in 800 steps |

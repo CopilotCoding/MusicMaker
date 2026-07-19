@@ -135,9 +135,11 @@ def build_cache(codec, textenc=None, raw_dir=None, force: bool = False,
             todo.append((audio_p, txt_p, name, npz))
 
     if todo and not quiet:
-        ui.log(f"[dim]encoding {len(todo)} track(s) through EnCodec + T5"
+        kind = type(codec).__name__.replace("Codec", "") or "codec"
+        ui.log(f"[dim]encoding {len(todo)} track(s) through {kind}"
+               + (" + T5" if textenc is not None else "")
                + (f", {len(out)} already cached" if out else "")
-               + " — one time, resumable[/]")
+               + " — one time, resumable (manifest flushed per track)[/]")
 
     # A single-shot encode of a 4-minute stereo track peaks at ~12.8GB. That
     # fits in 16GB only if the GPU is otherwise EMPTY. T5 is ~1GB and is not
