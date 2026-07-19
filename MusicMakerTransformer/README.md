@@ -126,7 +126,8 @@ absolute tripwire too.) Full story with receipts:
 | cached decode == full forward (delay) | 5.96e-07 |
 | flat model, one song memorized -> regenerated | **100.0%** free-run token match |
 | delay model, whole song in ONE window (323s) | **99.8%** free-run, audibly the song |
-| delay+DAC memorize/regenerate | **100.0%** free-run, 100.0% primed (median-stop + annealed consolidation) |
+| delay+DAC memorize/regenerate | **100.0%** free-run, 100.0% primed (median-stop + annealed consolidation, ~5,240 steps) |
+| same, `--auto` adaptive-LR controller | **100.0%** free-run in **4,165 steps** — probe-up/back-off, self-annealed 2.65e-3 → 4e-6, zero knobs |
 | delay training cost @ 28672 steps (334s), batch 1 | **9.4GB, 6.9s/step** |
 | delay throughput vs flat, same audio window | **3.2x** train, ~13x generation |
 | flat full-corpus baseline (LAMB 1e-3) | val 9.86 -> **7.74** in 800 steps |
@@ -145,7 +146,7 @@ and nothing else.
 | `train_delay.py` | delay training: pretrain / fine-tune / resume, LAMB+backoff |
 | `generate_delay.py` | delay sampling: CFG, per-head sampling, decode to audio |
 | `pretrain_fetch.py` | MTG-Jamendo -> token cache, streamed, sha256, resumable |
-| `overfit_one_delay.py` | memorize one song + audit + polish-to-target + regen |
+| `overfit_one_delay.py` | memorize one song + audit + regen; LR modes: default constant+anneal, `--cycles` SGDR, `--auto` probe/back-off (fastest measured) |
 | `dac_ceiling.py` | the codec A/B/C that decided the DAC swap |
 | `transformer.py` `train.py` `generate.py` | flat model (legacy, proven) |
 | `overfit_one.py` `diagnose_gen.py` | flat-model verification suite |

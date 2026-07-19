@@ -131,6 +131,22 @@ hours of audio contains what it contains. The optimizer designed for 32,768
 samples per step was, in the end, never the problem — and at batch four,
 never troubled.
 
+## Post-postscript: the schedule that schedules itself
+
+Having established that the learning rate barely matters at the start, we
+then removed the human from choosing it at all. A two-rule controller on the
+memorization harness — *pass-mean improved: lr ×1.05; didn't: lr ×0.7* —
+was set loose at batch one, LAMB underneath. It probed from 1e-3 up to
+2.65e-3 (a rate no hand would dare), detonated a pass (loss 18.1, one chunk
+knocked from ~98% to 11%), backed itself off through its own crater,
+recovered everything, and then annealed 1e-3 → 4e-6 with no schedule,
+no warmup, and no cosine — because at convergence, passes stop improving *by
+definition*, so the back-off rule **is** the anneal. It reached a 100.0%
+free-run reproduction in 4,165 steps; the hand-tuned constant-LR-plus-
+consolidation baseline needed ~5,240. The controller's only inputs are "did
+that help" and "was that a disaster," which we note is also the complete
+methodology of this paper.
+
 ---
 
 *Method details: 138M-parameter decoder-only transformer (d=768, 12L, 12H,
