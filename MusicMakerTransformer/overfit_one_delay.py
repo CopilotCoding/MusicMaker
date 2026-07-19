@@ -269,6 +269,18 @@ def main():
     t0 = time.time()
     steps_done = 0
     accs = {}
+
+    # Chunks the free-run test will actually regenerate. A weak chunk INSIDE
+    # this span derails the match from that point on (measured: cycle mode
+    # accepted chunk #0 at 99.5% as "residue" -> free-run 1.4%, primed 100%);
+    # a weak chunk OUTSIDE it is provably harmless to the test. No accept-
+    # and-stop path may fire while an in-span chunk is below target.
+    span = set(range((min(int(a.gen_seconds * fr), T) + n_q - 1) // S + 1))
+
+    def bad_in_span(ac):
+        return sorted(ci for ci, v in ac.items()
+                      if v < a.target_acc and ci in span)
+
     prog = ui.train_progress()
     task = prog.add_task("memorizing", total=a.steps, stats="") if prog else None
     if prog:
@@ -286,21 +298,27 @@ def main():
         #  2. NEVER END MID-HIGH: a cycle only starts if the step budget can
         #     finish it (the cap once landed mid-high-phase and the run ended
         #     with the model at its most disrupted -> free-run 1.5%).
-        #  3. STAGNATION STOP: if the below-target count stops improving for
-        #     3 cycles, the residue is alias-unfittable — accept and stop
-        #     instead of looping forever (this is cycle mode's early stop).
+        #  3. STAGNATION STOP: if audit MEAN ACCURACY stops improving for 3
+        #     cycles AND no below-target chunk sits in the free-run span, the
+        #     residue is alias-unfittable — accept and stop. (Judging on the
+        #     below-target COUNT was measured wrong twice: it saturates early,
+        #     and it once accepted chunk #0 — in-span — at 99.5%, which
+        #     produced free-run 1.4% with primed 100%.)
         PHASES = ((a.lr, 6), (a.lr / 10, 2), (a.lr / 100, 2))
         cycle = 0
-        prev_below, stagnant = None, 0
+        prev_acc, stagnant = None, 0
         while steps_done < a.steps:
             cycle += 1
             phases = PHASES
             if accs:
                 mean_acc = sum(accs.values()) / len(accs)
-                if mean_acc >= 99.98:
+                if mean_acc >= 99.98 and not bad_in_span(accs):
                     phases = PHASES[2:]      # consolidation only
                 elif mean_acc >= 99.9:
-                    phases = PHASES[1:]      # no high restart near convergence
+                    # no high restart near convergence; medium stays available
+                    # while any in-span chunk is weak — lr/100 alone was
+                    # measured too small to unstick chunk #0
+                    phases = PHASES[1:]
             need = sum(p for _, p in phases) * len(chunks)
             if steps_done + need > a.steps:
                 ui.log(f"[dim]stopping: {a.steps - steps_done} steps left "
@@ -321,25 +339,32 @@ def main():
                                 f"[dim]{steps_done/(time.time()-t0):.1f} st/s[/]"))
             accs = audit()
             n_below = sum(1 for v in accs.values() if v < a.target_acc)
+            mean_acc = sum(accs.values()) / len(accs)
             if prog:
                 prog.stop()
             ui.log(f"[dim]cycle {cycle} ({len(phases)} phases): mean "
-                   f"{sum(accs.values())/len(accs):.3f}% "
+                   f"{mean_acc:.3f}% "
                    f"worst {min(accs.values()):.3f}%  {n_below} below target  "
                    f"({steps_done} steps)[/]")
             if prog:
                 prog.start()
             if n_below == 0:
                 break
-            if prev_below is not None and n_below >= prev_below:
+            if prev_acc is not None and mean_acc <= prev_acc + 0.001:
                 stagnant += 1
-                if stagnant >= 3:
-                    ui.log(f"[yellow]{n_below} chunk(s) stagnant for 3 cycles "
-                           f"— accepting as alias-unfittable residue[/]")
-                    break
             else:
                 stagnant = 0
-            prev_below = n_below
+            prev_acc = mean_acc
+            if stagnant >= 3:
+                stuck = bad_in_span(accs)
+                if not stuck:
+                    ui.log(f"[yellow]{n_below} chunk(s) stagnant for 3 cycles, "
+                           f"all outside the free-run span — accepting as "
+                           f"alias-unfittable residue[/]")
+                    break
+                stagnant = 0
+                ui.log(f"[yellow]stagnant but chunk(s) {stuck} are IN the "
+                       f"free-run span — cannot accept, continuing[/]")
     elif a.auto:
         # EXPERIMENTAL probe-up/back-off controller. The unit of comparison is
         # one full in-order pass over ALL chunks — same chunks, same order, so
@@ -400,8 +425,15 @@ def main():
                 if n_below == 0:
                     break
                 if lr_now <= LO * 1.001:
-                    ui.log("[yellow]LR self-annealed to floor — accepting[/]")
-                    break
+                    stuck = bad_in_span(accs)
+                    if not stuck:
+                        ui.log("[yellow]LR self-annealed to floor — "
+                               "accepting[/]")
+                        break
+                    lr_now = a.lr / 100
+                    ui.log(f"[yellow]LR at floor but chunk(s) {stuck} are IN "
+                           f"the free-run span — bouncing lr to "
+                           f"{lr_now:.2e}[/]")
                 # decaying probe ceiling: no hot LR near convergence
                 if mean_acc >= 99.98:
                     hi_now = min(hi_now, a.lr / 10)
@@ -415,17 +447,28 @@ def main():
                     stagnant = 0
                 prev_acc = mean_acc
                 if stagnant >= 3:
-                    if mean_acc >= 99.9:
+                    stuck = bad_in_span(accs)
+                    if mean_acc >= 99.9 and not stuck:
                         ui.log(f"[yellow]{n_below} chunk(s) stagnant for 3 "
-                               f"audits at {mean_acc:.3f}% — accepting as "
-                               f"unfittable residue[/]")
+                               f"audits at {mean_acc:.3f}%, all outside the "
+                               f"free-run span — accepting as unfittable "
+                               f"residue[/]")
                         break
-                    # far from target and not moving: the LR is the problem,
-                    # not the data — kick down and keep going
-                    lr_now = max(lr_now * 0.5, LO)
                     stagnant = 0
-                    ui.log(f"[yellow]stagnant at {mean_acc:.3f}% (too low to "
-                           f"accept) — kicking lr down to {lr_now:.2e}[/]")
+                    if stuck and mean_acc >= 99.9:
+                        # converged everywhere except in-span stragglers: the
+                        # annealed LR is too small to unstick them — bounce up
+                        lr_now = min(max(lr_now * 10, a.lr / 100), hi_now)
+                        ui.log(f"[yellow]stagnant with chunk(s) {stuck} IN "
+                               f"the free-run span — bouncing lr to "
+                               f"{lr_now:.2e}[/]")
+                    else:
+                        # far from target and not moving: the LR is the
+                        # problem, not the data — kick down and keep going
+                        lr_now = max(lr_now * 0.5, LO)
+                        ui.log(f"[yellow]stagnant at {mean_acc:.3f}% (too low "
+                               f"to accept) — kicking lr down to "
+                               f"{lr_now:.2e}[/]")
         if not accs:
             accs = audit()
     else:
