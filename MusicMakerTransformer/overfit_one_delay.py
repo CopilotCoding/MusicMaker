@@ -349,11 +349,22 @@ def main():
         # didn't -> lr *= 0.7. At convergence passes stop improving by
         # definition, so the controller backs off repeatedly: it ANNEALS
         # ITSELF. Audit every 5 passes decides done/stagnant.
+        # GUARDS (measured necessary, first --auto run):
+        #  1. Stagnation is judged on audit MEAN ACCURACY, never the
+        #     below-target count — that count sits saturated at len(chunks)
+        #     all through early training (fired at pass 20 with worst-chunk
+        #     64% and still climbing fast).
+        #  2. "Accept as residue" is gated on mean acc >= 99.9. Stagnant far
+        #     below that is an LR problem, not aliasing — kick the LR down
+        #     and keep training instead of quitting.
+        #  3. The probe ceiling decays with accuracy (cycle mode's decaying-
+        #     restart lesson): high LR is destructive once nearly converged.
         lr_now = a.lr
         LO, HI = a.lr / 1000, a.lr * 3
+        hi_now = HI
         prev_mean = None
         pass_n = 0
-        prev_below, stagnant = None, 0
+        prev_acc, stagnant = None, 0
         while steps_done < a.steps:
             pass_n += 1
             for g in opt.param_groups:
@@ -370,17 +381,19 @@ def main():
                         f"[dim]{steps_done/(time.time()-t0):.1f} st/s[/]"))
             mean = tot / len(chunks)
             if prev_mean is None or mean < prev_mean:
-                lr_now = min(lr_now * 1.05, HI)      # improving: probe up
+                lr_now = min(lr_now * 1.05, hi_now)  # improving: probe up
             else:
                 lr_now = max(lr_now * 0.7, LO)       # worse: back off hard
             prev_mean = mean
             if pass_n % 5 == 0 or lr_now <= LO * 1.001:
                 accs = audit()
                 n_below = sum(1 for v in accs.values() if v < a.target_acc)
+                mean_acc = sum(accs.values()) / len(accs)
                 if prog:
                     prog.stop()
                 ui.log(f"[dim]pass {pass_n}: lr {lr_now:.2e} "
-                       f"pass-mean {mean:.4f}  worst {min(accs.values()):.3f}% "
+                       f"pass-mean {mean:.4f}  mean acc {mean_acc:.3f}% "
+                       f"worst {min(accs.values()):.3f}% "
                        f"{n_below} below  ({steps_done} steps)[/]")
                 if prog:
                     prog.start()
@@ -389,15 +402,30 @@ def main():
                 if lr_now <= LO * 1.001:
                     ui.log("[yellow]LR self-annealed to floor — accepting[/]")
                     break
-                if prev_below is not None and n_below >= prev_below:
+                # decaying probe ceiling: no hot LR near convergence
+                if mean_acc >= 99.98:
+                    hi_now = min(hi_now, a.lr / 10)
+                elif mean_acc >= 99.9:
+                    hi_now = min(hi_now, a.lr)
+                lr_now = min(lr_now, hi_now)
+                # stagnation on accuracy, gated by accuracy
+                if prev_acc is not None and mean_acc <= prev_acc + 0.001:
                     stagnant += 1
-                    if stagnant >= 3:
-                        ui.log(f"[yellow]{n_below} chunk(s) stagnant for 3 "
-                               f"audits — accepting as unfittable residue[/]")
-                        break
                 else:
                     stagnant = 0
-                prev_below = n_below
+                prev_acc = mean_acc
+                if stagnant >= 3:
+                    if mean_acc >= 99.9:
+                        ui.log(f"[yellow]{n_below} chunk(s) stagnant for 3 "
+                               f"audits at {mean_acc:.3f}% — accepting as "
+                               f"unfittable residue[/]")
+                        break
+                    # far from target and not moving: the LR is the problem,
+                    # not the data — kick down and keep going
+                    lr_now = max(lr_now * 0.5, LO)
+                    stagnant = 0
+                    ui.log(f"[yellow]stagnant at {mean_acc:.3f}% (too low to "
+                           f"accept) — kicking lr down to {lr_now:.2e}[/]")
         if not accs:
             accs = audit()
     else:
